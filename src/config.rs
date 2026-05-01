@@ -69,6 +69,12 @@ pub struct LimitsConfig {
     pub codex_max_turn_secs: u64,
     #[serde(default = "default_codex_max_output_bytes")]
     pub codex_max_output_bytes: usize,
+    #[serde(default = "default_broker_max_requests_per_window")]
+    pub broker_max_requests_per_window: usize,
+    #[serde(default = "default_broker_rate_limit_window_secs")]
+    pub broker_rate_limit_window_secs: u64,
+    #[serde(default = "default_broker_max_concurrent_requests")]
+    pub broker_max_concurrent_requests: usize,
 }
 
 impl Default for LimitsConfig {
@@ -81,6 +87,9 @@ impl Default for LimitsConfig {
             codex_inactivity_secs: default_codex_inactivity_secs(),
             codex_max_turn_secs: default_codex_max_turn_secs(),
             codex_max_output_bytes: default_codex_max_output_bytes(),
+            broker_max_requests_per_window: default_broker_max_requests_per_window(),
+            broker_rate_limit_window_secs: default_broker_rate_limit_window_secs(),
+            broker_max_concurrent_requests: default_broker_max_concurrent_requests(),
         }
     }
 }
@@ -147,6 +156,22 @@ impl AppConfig {
                 reason: "must be greater than zero",
             });
         }
+        if self.limits.broker_max_requests_per_window == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "limits.broker_max_requests_per_window",
+                reason: "must be greater than zero",
+            });
+        }
+        require_positive_u64(
+            "limits.broker_rate_limit_window_secs",
+            self.limits.broker_rate_limit_window_secs,
+        )?;
+        if self.limits.broker_max_concurrent_requests == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "limits.broker_max_concurrent_requests",
+                reason: "must be greater than zero",
+            });
+        }
 
         Ok(())
     }
@@ -209,6 +234,14 @@ pub fn codex_read_policy(config: &AppConfig) -> crate::codex::pty::PtyReadPolicy
     }
 }
 
+pub fn broker_limits(config: &AppConfig) -> crate::broker::BrokerLimits {
+    crate::broker::BrokerLimits {
+        max_requests_per_window: config.limits.broker_max_requests_per_window,
+        request_window: Duration::from_secs(config.limits.broker_rate_limit_window_secs),
+        max_concurrent_requests: config.limits.broker_max_concurrent_requests,
+    }
+}
+
 fn default_queue_depth() -> usize {
     16
 }
@@ -235,6 +268,18 @@ fn default_codex_max_turn_secs() -> u64 {
 
 fn default_codex_max_output_bytes() -> usize {
     512 * 1024
+}
+
+fn default_broker_max_requests_per_window() -> usize {
+    120
+}
+
+fn default_broker_rate_limit_window_secs() -> u64 {
+    60
+}
+
+fn default_broker_max_concurrent_requests() -> usize {
+    4
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use crate::{
     bot::telegram::TelegramSink,
+    broker::{BrokerToken, BrokerTokenRegistry},
     codex::pty::{PtyCodexSession, PtyReadPolicy},
     config::{BrokerConfig, CodexConfig, DockerConfig},
     ids::ChatId,
@@ -10,7 +11,7 @@ use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 use tokio::sync::Mutex;
 
@@ -71,6 +72,8 @@ where
     broker_config: BrokerConfig,
     read_policy: PtyReadPolicy,
     router: Arc<Router<PtyCodexSession, T>>,
+    broker_registry: BrokerTokenRegistry,
+    broker_tokens: StdMutex<HashMap<ChatId, BrokerToken>>,
     registered: Mutex<HashSet<ChatId>>,
     lifecycle_locks: Mutex<HashMap<ChatId, Arc<Mutex<()>>>>,
     statuses: Mutex<HashMap<ChatId, RuntimeStatusRecord>>,
@@ -88,6 +91,26 @@ where
         router: Arc<Router<PtyCodexSession, T>>,
         read_policy: PtyReadPolicy,
     ) -> Self {
+        Self::new_with_broker_registry(
+            docker,
+            docker_config,
+            codex_config,
+            broker_config,
+            router,
+            read_policy,
+            BrokerTokenRegistry::global(),
+        )
+    }
+
+    pub fn new_with_broker_registry(
+        docker: DockerSandboxBackend,
+        docker_config: DockerConfig,
+        codex_config: CodexConfig,
+        broker_config: BrokerConfig,
+        router: Arc<Router<PtyCodexSession, T>>,
+        read_policy: PtyReadPolicy,
+        broker_registry: BrokerTokenRegistry,
+    ) -> Self {
         Self {
             docker,
             docker_config,
@@ -95,6 +118,8 @@ where
             broker_config,
             read_policy,
             router,
+            broker_registry,
+            broker_tokens: StdMutex::new(HashMap::new()),
             registered: Mutex::new(HashSet::new()),
             lifecycle_locks: Mutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
@@ -130,7 +155,27 @@ where
         spec.broker_host = broker_host;
         spec.broker_port = broker_port;
         spec.broker_base_url = self.broker_config.public_base_url.clone();
+        spec.broker_token = self.broker_token_for_chat(chat_id);
         Ok(spec)
+    }
+
+    fn broker_token_for_chat(&self, chat_id: ChatId) -> BrokerToken {
+        let mut broker_tokens = self
+            .broker_tokens
+            .lock()
+            .expect("broker token map mutex should not be poisoned");
+        broker_tokens
+            .entry(chat_id)
+            .or_insert_with(BrokerToken::generate)
+            .clone()
+    }
+
+    fn rotate_broker_token_for_chat(&self, chat_id: ChatId) {
+        let mut broker_tokens = self
+            .broker_tokens
+            .lock()
+            .expect("broker token map mutex should not be poisoned");
+        broker_tokens.insert(chat_id, BrokerToken::generate());
     }
 
     async fn spawn_and_register_session(&self, spec: &SandboxSpec) -> Result<(), RuntimeError> {
@@ -150,6 +195,9 @@ where
             &docker_args,
             self.read_policy.clone(),
         )?);
+        self.broker_registry
+            .register_token(spec.chat_id, spec.broker_token.clone())
+            .await;
         let generation = self.mark_ready_with_next_generation(spec.chat_id).await;
         self.router
             .register_session(spec.chat_id, generation, session)
@@ -291,6 +339,10 @@ where
         clear_workspace: bool,
     ) -> Result<(), RuntimeError> {
         self.replace_chat_session(chat_id, async move {
+            if clear_workspace {
+                self.rotate_broker_token_for_chat(chat_id);
+                self.broker_registry.unregister_chat(chat_id).await;
+            }
             let spec = self.spec_for_chat(chat_id)?;
             if clear_workspace {
                 self.docker.rebuild(&spec, true).await?;
@@ -317,6 +369,8 @@ where
         clear_workspace: bool,
     ) -> Result<(), RuntimeError> {
         self.replace_chat_session(chat_id, async move {
+            self.rotate_broker_token_for_chat(chat_id);
+            self.broker_registry.unregister_chat(chat_id).await;
             let spec = self.spec_for_chat(chat_id)?;
             self.docker.rebuild(&spec, clear_workspace).await?;
             self.spawn_and_register_session(&spec).await
@@ -428,6 +482,27 @@ mod tests {
         let spec = manager.spec_for_chat(ChatId(1)).expect("spec should build");
 
         assert_eq!(spec.broker_host, "host.docker.internal");
+    }
+
+    #[test]
+    fn spec_for_chat_should_use_unique_broker_token() {
+        let (docker, codex, broker) = configs();
+        let (_telegram, router) = fake_runtime_router();
+        let manager = RuntimeManager::new(
+            DockerSandboxBackend,
+            docker,
+            codex,
+            broker,
+            Arc::new(router),
+            PtyReadPolicy::default(),
+        );
+
+        let first = manager.spec_for_chat(ChatId(1)).expect("spec should build");
+        let second = manager.spec_for_chat(ChatId(2)).expect("spec should build");
+
+        assert!(!first.broker_token.is_empty());
+        assert!(!second.broker_token.is_empty());
+        assert_ne!(first.broker_token, second.broker_token);
     }
 
     #[test]
