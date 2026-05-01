@@ -1,6 +1,8 @@
 use crate::{
     bot::telegram::{TelegramError, TelegramMessageHandle, TelegramSendOptions, TelegramSink},
-    codex::session::{CodexRequest, CodexSession, CodexSessionError, CodexTurn, CodexTurnEvent},
+    codex::session::{
+        CodexRequest, CodexSession, CodexSessionError, CodexTurn, CodexTurnEvent, GeneratedFile,
+    },
     config::{TelegramStreamingMode, TelegramUxConfig},
     ids::{ChatId, MessageId},
 };
@@ -251,6 +253,9 @@ where
                 }
 
                 if Self::worker_is_stale(&sessions, chat_id, generation).await {
+                    if let Ok(turn) = result {
+                        Self::cleanup_generated_files(turn.generated_files).await;
+                    }
                     state.finish_item();
                     break;
                 }
@@ -283,6 +288,7 @@ where
                                 "failed to send Codex response to Telegram"
                             );
                         }
+                        Self::send_generated_files(&telegram, chat_id, turn.generated_files).await;
                     }
                     Err(err) => {
                         let text = format!("Codex session failed: {err}");
@@ -376,6 +382,35 @@ where
             }
         });
         TypingHandle { stop: stop_tx }
+    }
+
+    async fn send_generated_files(telegram: &Arc<T>, chat_id: ChatId, files: Vec<GeneratedFile>) {
+        for file in files {
+            let caption = format!("Generated file: @{}", file.workspace_path);
+            if let Err(err) = telegram
+                .send_document(chat_id, &file.host_path, &file.file_name, Some(&caption))
+                .await
+            {
+                tracing::warn!(
+                    error = %err,
+                    chat_id = ?chat_id,
+                    workspace_path = %file.workspace_path,
+                    bytes = file.bytes,
+                    "failed to send generated file to Telegram"
+                );
+            }
+            if let Err(err) = tokio::fs::remove_file(&file.host_path).await {
+                log_generated_file_cleanup_error(&file, err);
+            }
+        }
+    }
+
+    async fn cleanup_generated_files(files: Vec<GeneratedFile>) {
+        for file in files {
+            if let Err(err) = tokio::fs::remove_file(&file.host_path).await {
+                log_generated_file_cleanup_error(&file, err);
+            }
+        }
     }
 
     async fn worker_is_stale(
@@ -493,6 +528,15 @@ fn telegram_send_options(telegram_ux: &TelegramUxConfig) -> TelegramSendOptions 
     }
 }
 
+fn log_generated_file_cleanup_error(file: &GeneratedFile, err: std::io::Error) {
+    tracing::debug!(
+        error = %err,
+        path = %file.host_path.display(),
+        workspace_path = %file.workspace_path,
+        "failed to remove temporary generated file"
+    );
+}
+
 fn streaming_preview(output: &str, max_chars: usize) -> String {
     let mut preview = String::new();
     let keep_chars = max_chars.saturating_sub(4);
@@ -603,9 +647,7 @@ mod tests {
             self.entered.notify_one();
             self.release.notified().await;
 
-            Ok(CodexTurn {
-                output: "final answer from codex".to_owned(),
-            })
+            Ok(CodexTurn::text("final answer from codex"))
         }
 
         async fn restart(&self) -> Result<(), CodexSessionError> {
@@ -619,9 +661,10 @@ mod tests {
             self.entered.notify_one();
             self.release.notified().await;
 
-            Ok(CodexTurn {
-                output: format!("{}: {}", self.reply_prefix, request.prompt),
-            })
+            Ok(CodexTurn::text(format!(
+                "{}: {}",
+                self.reply_prefix, request.prompt
+            )))
         }
 
         async fn restart(&self) -> Result<(), CodexSessionError> {
@@ -638,8 +681,32 @@ mod tests {
             self.prompts.lock().await.push(request.prompt.clone());
             self.active_sends.fetch_sub(1, Ordering::SeqCst);
 
+            Ok(CodexTurn::text(format!(
+                "{}: {}",
+                self.reply_prefix, request.prompt
+            )))
+        }
+
+        async fn restart(&self) -> Result<(), CodexSessionError> {
+            Ok(())
+        }
+    }
+
+    struct FileSession {
+        host_path: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl CodexSession for FileSession {
+        async fn send(&self, _request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
             Ok(CodexTurn {
-                output: format!("{}: {}", self.reply_prefix, request.prompt),
+                output: "Created @telegram_outputs/report.pdf".to_owned(),
+                generated_files: vec![GeneratedFile {
+                    workspace_path: "telegram_outputs/report.pdf".to_owned(),
+                    host_path: self.host_path.clone(),
+                    file_name: "report.pdf".to_owned(),
+                    bytes: 4,
+                }],
             })
         }
 
@@ -651,6 +718,7 @@ mod tests {
     struct FakeTelegram {
         messages: mpsc::UnboundedSender<String>,
         typing_actions: mpsc::UnboundedSender<ChatId>,
+        documents: mpsc::UnboundedSender<String>,
         next_message_id: AtomicI32,
     }
 
@@ -695,10 +763,32 @@ mod tests {
                 .send(chat_id)
                 .map_err(|err| TelegramError::ChatAction(err.to_string()))
         }
+
+        async fn send_document(
+            &self,
+            _chat_id: ChatId,
+            path: &std::path::Path,
+            file_name: &str,
+            caption: Option<&str>,
+        ) -> Result<TelegramMessageHandle, TelegramError> {
+            let text = format!(
+                "{}:{}:{}",
+                file_name,
+                path.exists(),
+                caption.unwrap_or_default()
+            );
+            self.documents
+                .send(text)
+                .map_err(|err| TelegramError::DocumentSend(err.to_string()))?;
+            Ok(TelegramMessageHandle {
+                chat_id: ChatId(1),
+                message_id: MessageId(self.next_message_id.fetch_add(1, Ordering::SeqCst)),
+            })
+        }
     }
 
     fn fake_telegram() -> (Arc<FakeTelegram>, mpsc::UnboundedReceiver<String>) {
-        let (telegram, messages, _typing_actions) = fake_telegram_with_actions();
+        let (telegram, messages, _typing_actions, _documents) = fake_telegram_with_actions();
         (telegram, messages)
     }
 
@@ -706,17 +796,21 @@ mod tests {
         Arc<FakeTelegram>,
         mpsc::UnboundedReceiver<String>,
         mpsc::UnboundedReceiver<ChatId>,
+        mpsc::UnboundedReceiver<String>,
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (typing_tx, typing_rx) = mpsc::unbounded_channel();
+        let (document_tx, document_rx) = mpsc::unbounded_channel();
         (
             Arc::new(FakeTelegram {
                 messages: tx,
                 typing_actions: typing_tx,
+                documents: document_tx,
                 next_message_id: AtomicI32::new(1),
             }),
             rx,
             typing_rx,
+            document_rx,
         )
     }
 
@@ -732,6 +826,23 @@ mod tests {
             .await
             .expect("typing action should arrive before timeout")
             .expect("typing sender should stay open")
+    }
+
+    async fn receive_document(rx: &mut mpsc::UnboundedReceiver<String>) -> String {
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("document should arrive before timeout")
+            .expect("telegram sender should stay open")
+    }
+
+    async fn wait_for_removed(path: &std::path::Path) {
+        timeout(Duration::from_secs(1), async {
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("temporary exported file should be removed after send attempt");
     }
 
     #[tokio::test]
@@ -751,6 +862,36 @@ mod tests {
 
         let message = receive_message(&mut messages).await;
         assert_eq!(message, "reply: hello");
+    }
+
+    #[tokio::test]
+    async fn enqueue_should_send_generated_files_after_text_response() {
+        let (telegram, mut messages, _typing_actions, mut documents) = fake_telegram_with_actions();
+        let temp = tempfile::NamedTempFile::new().expect("temp file should be created");
+        std::fs::write(temp.path(), b"test").expect("temp file should be writable");
+        let session = Arc::new(FileSession {
+            host_path: temp.path().to_path_buf(),
+        });
+        let router = Router::new(4, telegram);
+        router.register_session(ChatId(1), 1, session).await;
+
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "make file".to_owned(),
+            })
+            .await
+            .expect("enqueue should work");
+
+        assert_eq!(
+            receive_message(&mut messages).await,
+            "Created @telegram_outputs/report.pdf"
+        );
+        assert_eq!(
+            receive_document(&mut documents).await,
+            "report.pdf:true:Generated file: @telegram_outputs/report.pdf"
+        );
+        wait_for_removed(temp.path()).await;
     }
 
     #[tokio::test]
@@ -823,7 +964,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_should_send_typing_action_while_turn_is_active() {
-        let (telegram, _messages, mut typing_actions) = fake_telegram_with_actions();
+        let (telegram, _messages, mut typing_actions, _documents) = fake_telegram_with_actions();
         let session = Arc::new(SlowSession::new("reply"));
         let router = Router::new_with_telegram_ux(
             4,

@@ -104,7 +104,7 @@ Queue acknowledgements, typing indicators, response streaming, and Telegram form
 
 If Telegram edit rate limits appear in logs, increase `streaming_update_interval_millis` or `streaming_min_delta_chars`. If partial updates are too long, lower `streaming_max_chars`; the final response still uses normal chunking.
 
-If formatted responses are rejected by Telegram, keep `formatting_fallback_to_plain = true`. Use `formatting_escape = true` for arbitrary model output, and disable it only when the system prompt asks Codex to produce valid Telegram `markdown_v2` or `html`.
+If formatted responses are rejected by Telegram, keep `formatting_fallback_to_plain = true`. Use `formatting_escape = true` for arbitrary model output. In `markdown_v2` mode, `telellm` still converts common `**bold**` spans to Telegram bold while escaping the surrounding text.
 
 If slash commands such as `/remember` do not appear in the Telegram command menu, restart the daemon so it can register commands again, then reopen the Telegram chat to clear the client cache.
 

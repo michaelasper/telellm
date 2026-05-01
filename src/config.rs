@@ -17,6 +17,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub attachments: AttachmentConfig,
     #[serde(default)]
+    pub outputs: OutputConfig,
+    #[serde(default)]
     pub prompt: PromptConfig,
     pub storage: StorageConfig,
     pub docker: DockerConfig,
@@ -72,12 +74,35 @@ pub struct AttachmentConfig {
     pub max_file_bytes: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutputConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_output_workspace_dir")]
+    pub workspace_dir: String,
+    #[serde(default = "default_output_max_file_bytes")]
+    pub max_file_bytes: u64,
+    #[serde(default = "default_output_max_files_per_response")]
+    pub max_files_per_response: usize,
+}
+
 impl Default for AttachmentConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
             workspace_dir: default_attachment_workspace_dir(),
             max_file_bytes: default_attachment_max_file_bytes(),
+        }
+    }
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            workspace_dir: default_output_workspace_dir(),
+            max_file_bytes: default_output_max_file_bytes(),
+            max_files_per_response: default_output_max_files_per_response(),
         }
     }
 }
@@ -228,6 +253,7 @@ impl AppConfig {
         require_non_empty("telegram.bot_username", &self.telegram.bot_username)?;
         validate_telegram_ux_config(&self.telegram_ux)?;
         validate_attachment_config(&self.attachments)?;
+        validate_output_config(&self.outputs)?;
         require_non_empty("prompt.system_prompt", &self.prompt.system_prompt)?;
         require_non_empty("docker.image", &self.docker.image)?;
         require_non_empty("docker.network", &self.docker.network)?;
@@ -379,6 +405,24 @@ fn validate_attachment_config(attachments: &AttachmentConfig) -> Result<(), Conf
     if attachments.max_file_bytes == 0 {
         return Err(ConfigError::InvalidValue {
             field: "attachments.max_file_bytes",
+            reason: "must be greater than zero",
+        });
+    }
+    Ok(())
+}
+
+fn validate_output_config(outputs: &OutputConfig) -> Result<(), ConfigError> {
+    require_non_empty("outputs.workspace_dir", &outputs.workspace_dir)?;
+    validate_relative_workspace_path("outputs.workspace_dir", &outputs.workspace_dir)?;
+    if outputs.max_file_bytes == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "outputs.max_file_bytes",
+            reason: "must be greater than zero",
+        });
+    }
+    if outputs.max_files_per_response == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "outputs.max_files_per_response",
             reason: "must be greater than zero",
         });
     }
@@ -561,6 +605,18 @@ fn default_attachment_max_file_bytes() -> u64 {
     20_000_000
 }
 
+fn default_output_workspace_dir() -> String {
+    "telegram_outputs".to_owned()
+}
+
+fn default_output_max_file_bytes() -> u64 {
+    20_000_000
+}
+
+fn default_output_max_files_per_response() -> usize {
+    4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +758,16 @@ mod tests {
     }
 
     #[test]
+    fn from_toml_str_should_apply_default_output_config() {
+        let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
+
+        assert!(config.outputs.enabled);
+        assert_eq!(config.outputs.workspace_dir, "telegram_outputs");
+        assert_eq!(config.outputs.max_file_bytes, 20_000_000);
+        assert_eq!(config.outputs.max_files_per_response, 4);
+    }
+
+    #[test]
     fn from_toml_str_should_parse_configured_attachment_config() {
         let raw = valid_config().replace(
             "[storage]",
@@ -718,6 +784,27 @@ max_file_bytes = 1024
         assert!(!config.attachments.enabled);
         assert_eq!(config.attachments.workspace_dir, "uploads/from_telegram");
         assert_eq!(config.attachments.max_file_bytes, 1024);
+    }
+
+    #[test]
+    fn from_toml_str_should_parse_configured_output_config() {
+        let raw = valid_config().replace(
+            "[storage]",
+            r#"[outputs]
+enabled = false
+workspace_dir = "files/to_telegram"
+max_file_bytes = 2048
+max_files_per_response = 2
+
+[storage]"#,
+        );
+
+        let config = AppConfig::from_toml_str(&raw).expect("config should parse");
+
+        assert!(!config.outputs.enabled);
+        assert_eq!(config.outputs.workspace_dir, "files/to_telegram");
+        assert_eq!(config.outputs.max_file_bytes, 2048);
+        assert_eq!(config.outputs.max_files_per_response, 2);
     }
 
     #[test]
@@ -812,6 +899,48 @@ formatting_fallback_to_plain = false
         assert_eq!(
             err.to_string(),
             "config field `attachments.max_file_bytes` is invalid: must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_absolute_output_workspace_dir() {
+        let raw = format!(
+            "{}\n[outputs]\nworkspace_dir = \"/tmp/uploads\"\n",
+            valid_config()
+        );
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `outputs.workspace_dir` is invalid: must be a relative workspace path"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_zero_output_limits() {
+        let raw = format!("{}\n[outputs]\nmax_file_bytes = 0\n", valid_config());
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `outputs.max_file_bytes` is invalid: must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_zero_output_max_files_per_response() {
+        let raw = format!(
+            "{}\n[outputs]\nmax_files_per_response = 0\n",
+            valid_config()
+        );
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `outputs.max_files_per_response` is invalid: must be greater than zero"
         );
     }
 

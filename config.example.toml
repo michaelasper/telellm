@@ -26,6 +26,12 @@ enabled = true
 workspace_dir = "telegram_uploads"
 max_file_bytes = 20000000
 
+[outputs]
+enabled = true
+workspace_dir = "telegram_outputs"
+max_file_bytes = 20000000
+max_files_per_response = 4
+
 [prompt]
 system_prompt = """
 You are the Telegram group assistant for this chat.

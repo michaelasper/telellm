@@ -9,10 +9,10 @@ use teloxide::{
     dispatching::UpdateFilterExt,
     errors::AsResponseParameters,
     net::Download,
-    payloads::{EditMessageTextSetters, SendMessageSetters},
+    payloads::{EditMessageTextSetters, SendDocumentSetters, SendMessageSetters},
     prelude::*,
     types::{
-        BotCommand as TgBotCommand, ChatAction, ChatId as TgChatId, FileId, Message,
+        BotCommand as TgBotCommand, ChatAction, ChatId as TgChatId, FileId, InputFile, Message,
         MessageId as TgMessageId, ParseMode, User,
     },
     utils::{html, markdown},
@@ -62,6 +62,18 @@ pub trait TelegramSink: Send + Sync {
         Ok(())
     }
 
+    async fn send_document(
+        &self,
+        _chat_id: ChatId,
+        _path: &Path,
+        _file_name: &str,
+        _caption: Option<&str>,
+    ) -> Result<TelegramMessageHandle, TelegramError> {
+        Err(TelegramError::DocumentSend(
+            "telegram document uploads are not supported by this sink".to_owned(),
+        ))
+    }
+
     async fn download_file_to_path(
         &self,
         _file_id: &str,
@@ -106,6 +118,8 @@ pub enum TelegramError {
     ChatAction(String),
     #[error("telegram file download failed: {0}")]
     Download(String),
+    #[error("telegram document send failed: {0}")]
+    DocumentSend(String),
     #[error("telegram command registration failed: {0}")]
     CommandRegistration(String),
 }
@@ -321,6 +335,28 @@ impl TelegramSink for TeloxideTelegramSink {
             .map_err(|err| TelegramError::ChatAction(err.to_string()))
     }
 
+    async fn send_document(
+        &self,
+        chat_id: ChatId,
+        path: &Path,
+        file_name: &str,
+        caption: Option<&str>,
+    ) -> Result<TelegramMessageHandle, TelegramError> {
+        let document = InputFile::file(path.to_path_buf()).file_name(file_name.to_owned());
+        let mut request = self.bot.send_document(TgChatId(chat_id.0), document);
+        if let Some(caption) = caption {
+            request = request.caption(caption.to_owned());
+        }
+        let message = request
+            .await
+            .map_err(|err| TelegramError::DocumentSend(err.to_string()))?;
+
+        Ok(TelegramMessageHandle {
+            chat_id,
+            message_id: MessageId(message.id.0),
+        })
+    }
+
     async fn download_file_to_path(
         &self,
         file_id: &str,
@@ -365,7 +401,7 @@ fn render_for_telegram(text: &str, options: TelegramSendOptions) -> (String, Opt
         TelegramFormatMode::Plain => (text.to_owned(), None),
         TelegramFormatMode::MarkdownV2 => {
             let rendered = if options.formatting_escape {
-                markdown::escape(text)
+                render_model_markdown_v2(text)
             } else {
                 text.to_owned()
             };
@@ -380,6 +416,33 @@ fn render_for_telegram(text: &str, options: TelegramSendOptions) -> (String, Opt
             (rendered, Some(ParseMode::Html))
         }
     }
+}
+
+fn render_model_markdown_v2(text: &str) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find("**") {
+        output.push_str(&markdown::escape(&rest[..start]));
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("**") else {
+            output.push_str(&markdown::escape(&rest[start..]));
+            return output;
+        };
+
+        let inner = &after_start[..end];
+        if inner.is_empty() {
+            output.push_str(&markdown::escape("****"));
+        } else {
+            output.push('*');
+            output.push_str(&markdown::escape(inner));
+            output.push('*');
+        }
+        rest = &after_start[end + 2..];
+    }
+
+    output.push_str(&markdown::escape(rest));
+    output
 }
 
 fn streaming_preview(text: &str, limit: usize) -> String {
@@ -576,6 +639,34 @@ mod tests {
         let (text, parse_mode) = render_for_telegram("hi *there*", options);
 
         assert_eq!(text, "hi \\*there\\*");
+        assert_eq!(parse_mode, Some(ParseMode::MarkdownV2));
+    }
+
+    #[test]
+    fn render_for_telegram_should_translate_commonmark_bold_to_markdown_v2() {
+        let options = TelegramSendOptions {
+            formatting_mode: TelegramFormatMode::MarkdownV2,
+            formatting_escape: true,
+            formatting_fallback_to_plain: true,
+        };
+
+        let (text, parse_mode) = render_for_telegram("1. **Rapid-MLX**: best pick.", options);
+
+        assert_eq!(text, "1\\. *Rapid\\-MLX*: best pick\\.");
+        assert_eq!(parse_mode, Some(ParseMode::MarkdownV2));
+    }
+
+    #[test]
+    fn render_for_telegram_should_escape_unmatched_commonmark_bold_marker() {
+        let options = TelegramSendOptions {
+            formatting_mode: TelegramFormatMode::MarkdownV2,
+            formatting_escape: true,
+            formatting_fallback_to_plain: true,
+        };
+
+        let (text, parse_mode) = render_for_telegram("hi **there", options);
+
+        assert_eq!(text, "hi \\*\\*there");
         assert_eq!(parse_mode, Some(ParseMode::MarkdownV2));
     }
 

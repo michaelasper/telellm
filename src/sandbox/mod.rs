@@ -57,6 +57,12 @@ pub enum SandboxError {
     InvalidCodexAuthPath { path: PathBuf, reason: String },
     #[error("workspace path `{path}` is invalid: {reason}")]
     InvalidWorkspacePath { path: String, reason: String },
+    #[error("workspace file `{path}` is too large: {bytes} bytes exceeds limit {max_bytes}")]
+    WorkspaceFileTooLarge {
+        path: String,
+        bytes: u64,
+        max_bytes: u64,
+    },
 }
 
 #[cfg(test)]

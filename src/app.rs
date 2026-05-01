@@ -4,7 +4,7 @@ use crate::{
         message::{Addressing, IncomingAttachment, IncomingMessage},
         telegram::{IncomingMessageHandler, TelegramError},
     },
-    config::{AppConfig, AttachmentConfig, CodexAuthMode},
+    config::{AppConfig, AttachmentConfig, CodexAuthMode, OutputConfig},
     memory::{MemoryKind, MemoryStore, RollingBuffer, context::ContextPacket},
     router::{GroupWorkItem, Router, RouterError},
     runtime::{ChatRuntimeStatus, RuntimeControl, RuntimeState},
@@ -77,6 +77,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         crate::sandbox::docker::DockerSandboxBackend,
         config.docker.clone(),
         config.codex.clone(),
+        config.outputs.clone(),
         config.broker.clone(),
         router.clone(),
         crate::config::codex_read_policy(&config),
@@ -87,6 +88,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         allowed_chat_ids,
         queue_ack_enabled: config.telegram_ux.queue_ack_enabled,
         attachments: config.attachments.clone(),
+        outputs: config.outputs.clone(),
     };
     let app_core = Arc::new(AppCore::new(
         app_core_config,
@@ -112,6 +114,7 @@ where
     allowed_chat_ids: Vec<crate::ids::ChatId>,
     queue_ack_enabled: bool,
     attachments: AttachmentConfig,
+    outputs: OutputConfig,
     memory_store: Arc<M>,
     rolling: Arc<Mutex<RollingBuffer>>,
     router: Arc<Router<S, T>>,
@@ -125,6 +128,7 @@ pub struct AppCoreConfig {
     pub allowed_chat_ids: Vec<crate::ids::ChatId>,
     pub queue_ack_enabled: bool,
     pub attachments: AttachmentConfig,
+    pub outputs: OutputConfig,
 }
 
 impl<M, S, T, N> AppCore<M, S, T, N>
@@ -147,6 +151,7 @@ where
             allowed_chat_ids,
             queue_ack_enabled,
             attachments,
+            outputs,
         } = config;
 
         Self {
@@ -155,6 +160,7 @@ where
             allowed_chat_ids,
             queue_ack_enabled,
             attachments,
+            outputs,
             memory_store,
             rolling: Arc::new(Mutex::new(rolling)),
             router,
@@ -186,7 +192,7 @@ where
         let recent_messages = self.rolling.lock().await.recent_for_chat(message.chat_id);
         let memories = self.memory_store.list_memories(message.chat_id).await?;
         let packet = ContextPacket {
-            system_prompt: self.system_prompt.clone(),
+            system_prompt: self.system_prompt_for_turn(),
             triggering_message: message.clone(),
             recent_messages,
             memories,
@@ -272,6 +278,14 @@ where
 
     fn chat_allowed(&self, chat_id: crate::ids::ChatId) -> bool {
         self.allowed_chat_ids.is_empty() || self.allowed_chat_ids.contains(&chat_id)
+    }
+
+    fn system_prompt_for_turn(&self) -> String {
+        let Some(instruction) = crate::output::prompt_instruction(&self.outputs) else {
+            return self.system_prompt.clone();
+        };
+
+        format!("{}\n\n{}", self.system_prompt.trim(), instruction)
     }
 
     async fn reply_text(
@@ -593,6 +607,7 @@ mod tests {
             allowed_chat_ids,
             queue_ack_enabled,
             attachments: AttachmentConfig::default(),
+            outputs: OutputConfig::default(),
         }
     }
 
@@ -985,9 +1000,7 @@ mod tests {
     impl CodexSession for FakeCodexSession {
         async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
             self.prompts.fetch_add(1, Ordering::SeqCst);
-            Ok(CodexTurn {
-                output: request.prompt,
-            })
+            Ok(CodexTurn::text(request.prompt))
         }
 
         async fn restart(&self) -> Result<(), CodexSessionError> {
@@ -1017,9 +1030,7 @@ mod tests {
                 .map_err(|err| CodexSessionError::Pty(err.to_string()))?;
             self.release.notified().await;
 
-            Ok(CodexTurn {
-                output: request.prompt,
-            })
+            Ok(CodexTurn::text(request.prompt))
         }
 
         async fn restart(&self) -> Result<(), CodexSessionError> {

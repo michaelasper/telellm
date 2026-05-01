@@ -70,4 +70,6 @@ While the PTY produces output, the router can stream cleaned cumulative snapshot
 
 The final cleaned output is authoritative. If a streamed preview exists, the router edits it with the first final chunk and sends any remaining chunks as follow-up messages.
 
+If the final output mentions files under `@<outputs.workspace_dir>/...`, the runtime validates each path, copies matching files out of the chat sandbox, and the router sends them as Telegram documents after the final text response. Failed exports are logged and also appended to the text response as short attachment notes.
+
 The router can also refresh Telegram `typing` chat actions while work is queued or running. These indicators are transient Telegram UI state; they do not create messages and they stop when the bot sends a message.

@@ -30,7 +30,7 @@ All fields are optional. The section controls Telegram-facing behavior for Codex
 | `streaming_min_delta_chars` | integer | `80` | Minimum preview growth before another streaming edit is sent. |
 | `streaming_max_chars` | integer | `3900` | Maximum characters shown in a streaming preview. Final responses still use normal chunking. |
 | `formatting_mode` | string | `plain` | Response formatting mode. Valid values are `plain`, `markdown_v2`, and `html`. |
-| `formatting_escape` | boolean | `true` | Escapes model output before applying Telegram parse mode. Disable only when the model is prompted to produce valid Telegram formatting syntax. |
+| `formatting_escape` | boolean | `true` | Escapes model output before applying Telegram parse mode. In `markdown_v2`, common `**bold**` spans are converted to Telegram bold while surrounding text stays escaped. |
 | `formatting_fallback_to_plain` | boolean | `true` | Retries without parse mode when Telegram rejects formatted text. |
 
 `typing_refresh_secs`, `streaming_update_interval_millis`, and `streaming_min_delta_chars` must be greater than zero. `streaming_max_chars` must be at least `256`.
@@ -46,6 +46,19 @@ All fields are optional. The section controls Telegram photos and documents that
 | `max_file_bytes` | integer | `20000000` | Maximum Telegram file size to download. Larger files are noted in prompt context but not imported. |
 
 `workspace_dir` must be a non-empty relative path without parent directory components. `max_file_bytes` must be greater than zero.
+
+## `[outputs]`
+
+All fields are optional. The section controls files Codex creates in the chat workspace and mentions in its final answer.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | Exports mentioned files from the chat workspace and sends them as Telegram documents. |
+| `workspace_dir` | string | `telegram_outputs` | Relative directory under `/workspace` where Codex should write sendable files. |
+| `max_file_bytes` | integer | `20000000` | Maximum generated file size to export and upload. |
+| `max_files_per_response` | integer | `4` | Maximum number of generated files to send for one Codex response. |
+
+`workspace_dir` must be a non-empty relative path without parent directory components. `max_file_bytes` and `max_files_per_response` must be greater than zero.
 
 ## `[prompt]`
 

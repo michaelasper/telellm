@@ -14,6 +14,7 @@ On startup, `telellm` registers this command list with Telegram so clients can s
 | Mention of `@bot_username` | Enqueued as an addressed Codex prompt. |
 | Reply to a bot message | Enqueued as an addressed Codex prompt. |
 | Photo or document with caption, in a DM, or in the replied-to message | Downloaded into the chat workspace when addressed. |
+| Generated file reference in Codex response | Files under `outputs.workspace_dir` are sent as Telegram documents when the final response mentions them as `@...` paths. |
 | Plain ambient group message | Stored only in the in-memory recent buffer when Telegram delivers it. |
 
 ## Commands
@@ -54,7 +55,7 @@ If `telegram_ux.typing_indicator_enabled` and `telegram_ux.typing_for_queued_ite
 
 When `telegram_ux.streaming_enabled` is enabled, addressed Codex prompts can produce a bot-owned streaming message that is edited with throttled output snapshots. The final Codex answer replaces the preview before any remaining chunks are sent.
 
-Response formatting is controlled by `telegram_ux.formatting_mode`. The default `plain` mode sends text without Telegram parsing. `markdown_v2` and `html` use Telegram parse modes and can escape model output before sending when `telegram_ux.formatting_escape` is enabled.
+Response formatting is controlled by `telegram_ux.formatting_mode`. The default `plain` mode sends text without Telegram parsing. `markdown_v2` and `html` use Telegram parse modes and can escape model output before sending when `telegram_ux.formatting_escape` is enabled. In `markdown_v2` mode, escaped output also converts common `**bold**` spans to Telegram bold.
 
 ## Command Parse Errors
 

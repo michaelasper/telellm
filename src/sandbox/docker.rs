@@ -157,6 +157,82 @@ impl DockerSandboxBackend {
         .await
     }
 
+    pub async fn export_file_from_workspace(
+        &self,
+        spec: &SandboxSpec,
+        workspace_path: &str,
+        destination: &Path,
+        max_bytes: u64,
+    ) -> Result<u64, SandboxError> {
+        Self::validate_workspace_path(workspace_path)?;
+        let remote_path = format!("/workspace/{workspace_path}");
+        let bytes = Self::workspace_file_size(spec, workspace_path, &remote_path).await?;
+        if bytes > max_bytes {
+            return Err(SandboxError::WorkspaceFileTooLarge {
+                path: workspace_path.to_owned(),
+                bytes,
+                max_bytes,
+            });
+        }
+
+        Self::docker(&[
+            "cp".to_owned(),
+            format!("{}:{remote_path}", spec.sandbox_id),
+            destination.display().to_string(),
+        ])
+        .await?;
+        let metadata = std::fs::metadata(destination)?;
+        if !metadata.is_file() {
+            return Err(SandboxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("exported workspace path is not a file: {workspace_path}"),
+            )));
+        }
+        Ok(metadata.len())
+    }
+
+    async fn workspace_file_size(
+        spec: &SandboxSpec,
+        workspace_path: &str,
+        remote_path: &str,
+    ) -> Result<u64, SandboxError> {
+        Self::docker(&[
+            "exec".to_owned(),
+            "--user".to_owned(),
+            "root".to_owned(),
+            spec.sandbox_id.to_string(),
+            "test".to_owned(),
+            "-f".to_owned(),
+            remote_path.to_owned(),
+        ])
+        .await?;
+        let output = Self::docker_output(&[
+            "exec".to_owned(),
+            "--user".to_owned(),
+            "root".to_owned(),
+            spec.sandbox_id.to_string(),
+            "stat".to_owned(),
+            "-c".to_owned(),
+            "%s".to_owned(),
+            remote_path.to_owned(),
+        ])
+        .await?;
+        if !output.status.success() {
+            return Err(SandboxError::Docker(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| {
+                SandboxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid size for workspace file {workspace_path}: {error}"),
+                ))
+            })
+    }
+
     fn validate_workspace_path(workspace_path: &str) -> Result<(), SandboxError> {
         let path = Path::new(workspace_path);
         if path.is_absolute() {

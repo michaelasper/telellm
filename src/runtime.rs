@@ -4,10 +4,14 @@ use crate::{
     codex::{
         exec::CommandCodexSession,
         pty::{PtyCodexSession, PtyReadPolicy},
-        session::{CodexEventSender, CodexRequest, CodexSession, CodexSessionError, CodexTurn},
+        session::{
+            CodexEventSender, CodexRequest, CodexSession, CodexSessionError, CodexTurn,
+            GeneratedFile,
+        },
     },
-    config::{BrokerConfig, CodexAuthMode, CodexConfig, DockerConfig},
+    config::{BrokerConfig, CodexAuthMode, CodexConfig, DockerConfig, OutputConfig},
     ids::ChatId,
+    output::{extract_file_refs, file_name_for_workspace_path},
     router::Router,
     sandbox::{SandboxBackend, SandboxError, SandboxSpec, docker::DockerSandboxBackend},
 };
@@ -15,8 +19,9 @@ use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
 
@@ -87,17 +92,24 @@ impl Default for RuntimeStatusRecord {
 }
 
 pub enum ManagedCodexSession {
-    Pty(PtyCodexSession),
-    Command(CommandCodexSession),
+    Pty {
+        session: PtyCodexSession,
+        output_collector: OutputCollector,
+    },
+    Command {
+        session: CommandCodexSession,
+        output_collector: OutputCollector,
+    },
 }
 
 #[async_trait]
 impl CodexSession for ManagedCodexSession {
     async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
-        match self {
-            Self::Pty(session) => session.send(request).await,
-            Self::Command(session) => session.send(request).await,
-        }
+        let turn = match self {
+            Self::Pty { session, .. } => session.send(request).await?,
+            Self::Command { session, .. } => session.send(request).await?,
+        };
+        self.collect_outputs(turn).await
     }
 
     async fn send_with_events(
@@ -105,17 +117,151 @@ impl CodexSession for ManagedCodexSession {
         request: CodexRequest,
         events: Option<CodexEventSender>,
     ) -> Result<CodexTurn, CodexSessionError> {
-        match self {
-            Self::Pty(session) => session.send_with_events(request, events).await,
-            Self::Command(session) => session.send_with_events(request, events).await,
-        }
+        let turn = match self {
+            Self::Pty { session, .. } => session.send_with_events(request, events).await?,
+            Self::Command { session, .. } => session.send_with_events(request, events).await?,
+        };
+        self.collect_outputs(turn).await
     }
 
     async fn restart(&self) -> Result<(), CodexSessionError> {
         match self {
-            Self::Pty(session) => session.restart().await,
-            Self::Command(session) => session.restart().await,
+            Self::Pty { session, .. } => session.restart().await,
+            Self::Command { session, .. } => session.restart().await,
         }
+    }
+}
+
+impl ManagedCodexSession {
+    async fn collect_outputs(&self, mut turn: CodexTurn) -> Result<CodexTurn, CodexSessionError> {
+        let collector = match self {
+            Self::Pty {
+                output_collector, ..
+            }
+            | Self::Command {
+                output_collector, ..
+            } => output_collector,
+        };
+        let collected = collector.collect(&turn.output).await;
+        turn.generated_files = collected.files;
+        if !collected.warnings.is_empty() {
+            turn.output.push_str("\n\n");
+            for warning in collected.warnings {
+                turn.output.push_str(&warning);
+                turn.output.push('\n');
+            }
+            turn.output = turn.output.trim_end().to_owned();
+        }
+        Ok(turn)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OutputCollector {
+    docker: DockerSandboxBackend,
+    spec: SandboxSpec,
+    config: OutputConfig,
+}
+
+#[derive(Debug, Default)]
+struct CollectedOutputs {
+    files: Vec<GeneratedFile>,
+    warnings: Vec<String>,
+}
+
+impl OutputCollector {
+    fn new(docker: DockerSandboxBackend, spec: SandboxSpec, config: OutputConfig) -> Self {
+        Self {
+            docker,
+            spec,
+            config,
+        }
+    }
+
+    async fn collect(&self, output: &str) -> CollectedOutputs {
+        let mut collected = CollectedOutputs::default();
+        if !self.config.enabled {
+            return collected;
+        }
+
+        let refs = extract_file_refs(
+            output,
+            &self.config.workspace_dir,
+            self.config.max_files_per_response,
+        );
+        for (index, workspace_path) in refs.iter().enumerate() {
+            match self.export_file(index, workspace_path).await {
+                Ok(file) => collected.files.push(file),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        chat_id = ?self.spec.chat_id,
+                        workspace_path,
+                        "failed to export generated file"
+                    );
+                    collected
+                        .warnings
+                        .push(format!("Could not attach @{workspace_path}: {error}"));
+                }
+            }
+        }
+
+        collected
+    }
+
+    async fn export_file(
+        &self,
+        index: usize,
+        workspace_path: &str,
+    ) -> Result<GeneratedFile, RuntimeError> {
+        let file_name = file_name_for_workspace_path(workspace_path);
+        let host_path = temp_generated_output_path(self.spec.chat_id, index, &file_name);
+        let bytes = self
+            .docker
+            .export_file_from_workspace(
+                &self.spec,
+                workspace_path,
+                &host_path,
+                self.config.max_file_bytes,
+            )
+            .await?;
+        Ok(GeneratedFile {
+            workspace_path: workspace_path.to_owned(),
+            host_path,
+            file_name,
+            bytes,
+        })
+    }
+}
+
+fn temp_generated_output_path(chat_id: ChatId, index: usize, file_name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "telellm-output-{}-{}-{}-{}-{}",
+        std::process::id(),
+        chat_id.0,
+        index,
+        nanos,
+        sanitize_host_file_name(file_name)
+    ))
+}
+
+fn sanitize_host_file_name(file_name: &str) -> String {
+    let mut sanitized = String::with_capacity(file_name.len().min(128));
+    for ch in file_name.chars().take(128) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() {
+        "telegram-output".to_owned()
+    } else {
+        sanitized
     }
 }
 
@@ -126,6 +272,7 @@ where
     docker: DockerSandboxBackend,
     docker_config: DockerConfig,
     codex_config: CodexConfig,
+    output_config: OutputConfig,
     broker_config: Option<BrokerConfig>,
     read_policy: PtyReadPolicy,
     router: Arc<Router<ManagedCodexSession, T>>,
@@ -151,6 +298,7 @@ where
         docker: DockerSandboxBackend,
         docker_config: DockerConfig,
         codex_config: CodexConfig,
+        output_config: OutputConfig,
         broker_config: Option<BrokerConfig>,
         router: Arc<Router<ManagedCodexSession, T>>,
         read_policy: PtyReadPolicy,
@@ -159,6 +307,7 @@ where
             docker,
             docker_config,
             codex_config,
+            output_config,
             broker_config,
             router,
             read_policy,
@@ -166,10 +315,15 @@ where
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor wires runtime dependencies and optional test registry explicitly"
+    )]
     pub fn new_with_broker_registry(
         docker: DockerSandboxBackend,
         docker_config: DockerConfig,
         codex_config: CodexConfig,
+        output_config: OutputConfig,
         broker_config: Option<BrokerConfig>,
         router: Arc<Router<ManagedCodexSession, T>>,
         read_policy: PtyReadPolicy,
@@ -179,6 +333,7 @@ where
             docker,
             docker_config,
             codex_config,
+            output_config,
             broker_config,
             read_policy,
             router,
@@ -306,22 +461,31 @@ where
         &self,
         spec: &SandboxSpec,
     ) -> Result<ManagedCodexSession, RuntimeError> {
+        let output_collector = OutputCollector::new(
+            self.docker.clone(),
+            spec.clone(),
+            self.output_config.clone(),
+        );
         if self.codex_uses_noninteractive_exec() {
-            return Ok(ManagedCodexSession::Command(CommandCodexSession::new(
-                "docker",
-                self.codex_exec_docker_args(spec),
-                self.read_policy.max_turn_timeout,
-                self.read_policy.max_output_bytes,
-            )));
+            return Ok(ManagedCodexSession::Command {
+                session: CommandCodexSession::new(
+                    "docker",
+                    self.codex_exec_docker_args(spec),
+                    self.read_policy.max_turn_timeout,
+                    self.read_policy.max_output_bytes,
+                ),
+                output_collector,
+            });
         }
 
-        Ok(ManagedCodexSession::Pty(
-            PtyCodexSession::spawn_with_read_policy(
+        Ok(ManagedCodexSession::Pty {
+            session: PtyCodexSession::spawn_with_read_policy(
                 "docker",
                 &self.codex_pty_docker_args(spec),
                 self.read_policy.clone(),
             )?,
-        ))
+            output_collector,
+        })
     }
 
     fn codex_uses_noninteractive_exec(&self) -> bool {
@@ -634,7 +798,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AppConfig, BrokerConfig, CodexAuthMode, CodexConfig, DockerConfig, LimitsConfig,
-        StorageConfig, TelegramConfig, codex_read_policy,
+        OutputConfig, StorageConfig, TelegramConfig, codex_read_policy,
     };
     use std::{
         collections::BTreeMap,
@@ -681,6 +845,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             Some(broker),
             Arc::new(router),
             PtyReadPolicy::default(),
@@ -699,6 +864,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             Some(broker),
             Arc::new(router),
             PtyReadPolicy::default(),
@@ -722,6 +888,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             None,
             Arc::new(router),
             PtyReadPolicy::default(),
@@ -744,6 +911,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             None,
             Arc::new(router),
             PtyReadPolicy::default(),
@@ -767,6 +935,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             None,
             Arc::new(router),
             PtyReadPolicy::default(),
@@ -790,6 +959,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             Some(broker),
             Arc::new(router),
             PtyReadPolicy::default(),
@@ -816,6 +986,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             None,
             Arc::new(router),
             PtyReadPolicy::default(),
@@ -850,6 +1021,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             Some(broker),
             Arc::new(router),
             PtyReadPolicy::default(),
@@ -884,6 +1056,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             Some(broker),
             Arc::new(router),
             PtyReadPolicy::default(),
@@ -907,6 +1080,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             Some(broker),
             Arc::new(router),
             PtyReadPolicy::default(),
@@ -930,6 +1104,7 @@ mod tests {
             },
             telegram_ux: crate::config::TelegramUxConfig::default(),
             attachments: crate::config::AttachmentConfig::default(),
+            outputs: OutputConfig::default(),
             prompt: crate::config::PromptConfig::default(),
             storage: StorageConfig {
                 sqlite_path: "data/telellm.sqlite".into(),
@@ -952,6 +1127,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             Some(broker),
             Arc::new(router),
             read_policy,
@@ -1147,6 +1323,7 @@ mod tests {
             DockerSandboxBackend,
             docker,
             codex,
+            OutputConfig::default(),
             Some(broker),
             Arc::new(router),
             PtyReadPolicy::default(),

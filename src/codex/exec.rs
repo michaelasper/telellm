@@ -99,9 +99,9 @@ impl CodexSession for CommandCodexSession {
             )));
         }
 
-        Ok(CodexTurn {
-            output: String::from_utf8_lossy(&stdout).trim().to_owned(),
-        })
+        Ok(CodexTurn::text(
+            String::from_utf8_lossy(&stdout).trim().to_owned(),
+        ))
     }
 
     async fn restart(&self) -> Result<(), CodexSessionError> {

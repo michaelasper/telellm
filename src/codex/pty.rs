@@ -126,9 +126,9 @@ impl CodexSession for PtyCodexSession {
                 CodexSessionError::Pty(format!("failed flushing pty writer: {err}"))
             })?;
 
-            Ok(CodexTurn {
-                output: guard.read_turn_output(&request.prompt, events.as_ref())?,
-            })
+            Ok(CodexTurn::text(
+                guard.read_turn_output(&request.prompt, events.as_ref())?,
+            ))
         })
         .await
         .map_err(|err| CodexSessionError::Pty(err.to_string()))?

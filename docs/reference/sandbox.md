@@ -86,6 +86,7 @@ It installs:
 - `openssh-client`
 - `procps`
 - `python3`
+- `python3-reportlab`
 - `util-linux`
 - `@openai/codex`
 

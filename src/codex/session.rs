@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,6 +10,24 @@ pub struct CodexRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexTurn {
     pub output: String,
+    pub generated_files: Vec<GeneratedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedFile {
+    pub workspace_path: String,
+    pub host_path: PathBuf,
+    pub file_name: String,
+    pub bytes: u64,
+}
+
+impl CodexTurn {
+    pub fn text(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            generated_files: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
