@@ -86,7 +86,7 @@ Use this full script once `scripts/check.sh` exists:
 - Create: `src/main.rs`
 - Create: `scripts/check.sh`
 
-- [ ] **Step 1: Initialize the package**
+- [x] **Step 1: Initialize the package**
 
 Run:
 
@@ -96,7 +96,7 @@ cargo init --bin --name telellm .
 
 Expected: `Cargo.toml` and `src/main.rs` exist.
 
-- [ ] **Step 2: Add dependencies**
+- [x] **Step 2: Add dependencies**
 
 Run these exact commands:
 
@@ -123,7 +123,7 @@ cargo add tempfile --dev
 
 Expected: `Cargo.toml` includes the added crates and `Cargo.lock` is created.
 
-- [ ] **Step 3: Add lint policy to `Cargo.toml`**
+- [x] **Step 3: Add lint policy to `Cargo.toml`**
 
 Append this content:
 
@@ -141,7 +141,7 @@ needless_collect = { level = "deny", priority = 8 }
 manual_ok_or = { level = "deny", priority = 8 }
 ```
 
-- [ ] **Step 4: Pin the Rust toolchain**
+- [x] **Step 4: Pin the Rust toolchain**
 
 Create `rust-toolchain.toml`:
 
@@ -151,7 +151,7 @@ channel = "stable"
 components = ["clippy", "rustfmt"]
 ```
 
-- [ ] **Step 5: Create the library module shell**
+- [x] **Step 5: Create the library module shell**
 
 Replace `src/lib.rs` with:
 
@@ -168,7 +168,7 @@ pub mod runtime;
 pub mod sandbox;
 ```
 
-- [ ] **Step 6: Create the binary entry point**
+- [x] **Step 6: Create the binary entry point**
 
 Replace `src/main.rs` with:
 
@@ -201,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 7: Create temporary module stubs so the package compiles**
+- [x] **Step 7: Create temporary module stubs so the package compiles**
 
 Create these files with the shown content:
 
@@ -364,7 +364,7 @@ pub struct DockerSandboxBackend;
 pub struct NetworkPolicy;
 ```
 
-- [ ] **Step 8: Add the check script**
+- [x] **Step 8: Add the check script**
 
 Create `scripts/check.sh`:
 
@@ -386,7 +386,7 @@ chmod +x scripts/check.sh
 
 Expected: all commands pass.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 Run:
 
@@ -404,7 +404,7 @@ git commit -m "chore: scaffold Rust daemon"
 - Modify: `src/config.rs`
 - Create: `config.example.toml`
 
-- [ ] **Step 1: Write typed ID tests in `src/ids.rs`**
+- [x] **Step 1: Write typed ID tests in `src/ids.rs`**
 
 Replace `src/ids.rs` with:
 
@@ -461,7 +461,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run typed ID tests**
+- [x] **Step 2: Run typed ID tests**
 
 Run:
 
@@ -471,7 +471,7 @@ cargo test ids::
 
 Expected: PASS.
 
-- [ ] **Step 3: Replace `src/config.rs` with validated config types**
+- [x] **Step 3: Replace `src/config.rs` with validated config types**
 
 Use this content:
 
@@ -705,7 +705,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Add example config**
+- [x] **Step 4: Add example config**
 
 Create `config.example.toml`:
 
@@ -740,7 +740,7 @@ recent_buffer_messages = 200
 codex_inactivity_secs = 600
 ```
 
-- [ ] **Step 5: Run validation**
+- [x] **Step 5: Run validation**
 
 Run:
 
@@ -750,7 +750,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -768,7 +768,7 @@ git commit -m "feat: add typed ids and config validation"
 - Modify: `src/bot/message.rs`
 - Modify: `src/bot/chunk.rs`
 
-- [ ] **Step 1: Replace command parser with tests**
+- [x] **Step 1: Replace command parser with tests**
 
 Use this content for `src/bot/command.rs`:
 
@@ -894,7 +894,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Replace message addressing**
+- [x] **Step 2: Replace message addressing**
 
 Use this content for `src/bot/message.rs`:
 
@@ -972,7 +972,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Replace chunking with UTF-8 safe chunking**
+- [x] **Step 3: Replace chunking with UTF-8 safe chunking**
 
 Use this content for `src/bot/chunk.rs`:
 
@@ -1020,7 +1020,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run validation**
+- [x] **Step 4: Run validation**
 
 Run:
 
@@ -1030,7 +1030,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run:
 
@@ -1049,7 +1049,7 @@ git commit -m "feat: add bot command and addressing logic"
 - Modify: `src/memory/sqlite.rs`
 - Modify: `src/memory/mod.rs`
 
-- [ ] **Step 1: Implement rolling buffer**
+- [x] **Step 1: Implement rolling buffer**
 
 Replace `src/memory/rolling.rs` with:
 
@@ -1118,7 +1118,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Define durable memory store trait and types**
+- [x] **Step 2: Define durable memory store trait and types**
 
 Replace `src/memory/store.rs` with:
 
@@ -1194,7 +1194,7 @@ pub enum MemoryStoreError {
 }
 ```
 
-- [ ] **Step 3: Implement SQLite store**
+- [x] **Step 3: Implement SQLite store**
 
 Replace `src/memory/sqlite.rs` with:
 
@@ -1343,7 +1343,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Export memory types**
+- [x] **Step 4: Export memory types**
 
 Replace `src/memory/mod.rs` with:
 
@@ -1358,7 +1358,7 @@ pub use sqlite::SqliteMemoryStore;
 pub use store::{MemoryKind, MemoryRecord, MemoryStore, MemoryStoreError};
 ```
 
-- [ ] **Step 5: Run validation**
+- [x] **Step 5: Run validation**
 
 Run:
 
@@ -1368,7 +1368,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -1385,7 +1385,7 @@ git commit -m "feat: add memory storage"
 - Modify: `src/memory/context.rs`
 - Modify: `src/codex/prompt.rs`
 
-- [ ] **Step 1: Implement context packet builder**
+- [x] **Step 1: Implement context packet builder**
 
 Replace `src/memory/context.rs` with:
 
@@ -1478,7 +1478,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Implement prompt envelope**
+- [x] **Step 2: Implement prompt envelope**
 
 Replace `src/codex/prompt.rs` with:
 
@@ -1533,7 +1533,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run validation**
+- [x] **Step 3: Run validation**
 
 Run:
 
@@ -1543,7 +1543,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 Run:
 
@@ -1561,7 +1561,7 @@ git commit -m "feat: build codex prompt context"
 - Modify: `src/sandbox/network.rs`
 - Modify: `src/sandbox/docker.rs`
 
-- [ ] **Step 1: Define sandbox trait**
+- [x] **Step 1: Define sandbox trait**
 
 Replace `src/sandbox/mod.rs` with:
 
@@ -1630,7 +1630,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Implement network policy script**
+- [x] **Step 2: Implement network policy script**
 
 Replace `src/sandbox/network.rs` with:
 
@@ -1700,7 +1700,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Implement Docker command builder and backend shell**
+- [x] **Step 3: Implement Docker command builder and backend shell**
 
 Replace `src/sandbox/docker.rs` with:
 
@@ -1819,7 +1819,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run validation**
+- [x] **Step 4: Run validation**
 
 Run:
 
@@ -1829,7 +1829,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run:
 
@@ -1847,7 +1847,7 @@ git commit -m "feat: add docker sandbox backend"
 - Modify: `src/codex/pty.rs`
 - Create: `tests/pty_session.rs`
 
-- [ ] **Step 1: Define Codex session trait**
+- [x] **Step 1: Define Codex session trait**
 
 Replace `src/codex/session.rs` with:
 
@@ -1879,7 +1879,7 @@ pub enum CodexSessionError {
 }
 ```
 
-- [ ] **Step 2: Implement a PTY session with serialized sends**
+- [x] **Step 2: Implement a PTY session with serialized sends**
 
 Replace `src/codex/pty.rs` with:
 
@@ -1984,7 +1984,7 @@ impl CodexSession for PtyCodexSession {
 }
 ```
 
-- [ ] **Step 3: Add PTY integration test**
+- [x] **Step 3: Add PTY integration test**
 
 Create `tests/pty_session.rs`:
 
@@ -2009,7 +2009,7 @@ async fn pty_session_should_round_trip_input_to_cat_process() {
 }
 ```
 
-- [ ] **Step 4: Run the PTY test**
+- [x] **Step 4: Run the PTY test**
 
 Run:
 
@@ -2019,7 +2019,7 @@ cargo test --test pty_session
 
 Expected: PASS.
 
-- [ ] **Step 5: Run validation**
+- [x] **Step 5: Run validation**
 
 Run:
 
@@ -2029,7 +2029,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -2046,7 +2046,7 @@ git commit -m "feat: add pty codex session"
 - Modify: `src/router.rs`
 - Modify: `src/bot/telegram.rs`
 
-- [ ] **Step 1: Define Telegram sink test double boundary**
+- [x] **Step 1: Define Telegram sink test double boundary**
 
 Replace `src/bot/telegram.rs` with:
 
@@ -2068,7 +2068,7 @@ pub enum TelegramError {
 pub struct TelegramAdapter;
 ```
 
-- [ ] **Step 2: Implement router with tests**
+- [x] **Step 2: Implement router with tests**
 
 Replace `src/router.rs` with:
 
@@ -2233,7 +2233,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run validation**
+- [x] **Step 3: Run validation**
 
 Run:
 
@@ -2243,7 +2243,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 Run:
 
@@ -2259,7 +2259,7 @@ git commit -m "feat: add per-group router"
 **Files:**
 - Modify: `src/broker.rs`
 
-- [ ] **Step 1: Add broker route and forwarding model**
+- [x] **Step 1: Add broker route and forwarding model**
 
 Replace `src/broker.rs` with:
 
@@ -2385,7 +2385,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run validation**
+- [x] **Step 2: Run validation**
 
 Run:
 
@@ -2395,7 +2395,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 Run:
 
@@ -2412,7 +2412,7 @@ git commit -m "feat: add host auth broker"
 - Modify: `src/app.rs`
 - Modify: `src/bot/mod.rs`
 
-- [ ] **Step 1: Add app orchestration types**
+- [x] **Step 1: Add app orchestration types**
 
 Replace `src/app.rs` with:
 
@@ -2534,7 +2534,7 @@ pub enum AppError {
 }
 ```
 
-- [ ] **Step 2: Ensure bot exports are clean**
+- [x] **Step 2: Ensure bot exports are clean**
 
 Replace `src/bot/mod.rs` with:
 
@@ -2545,7 +2545,7 @@ pub mod message;
 pub mod telegram;
 ```
 
-- [ ] **Step 3: Run validation**
+- [x] **Step 3: Run validation**
 
 Run:
 
@@ -2555,7 +2555,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 Run:
 
@@ -2572,7 +2572,7 @@ git commit -m "feat: wire app message flow"
 - Modify: `src/bot/telegram.rs`
 - Modify: `src/bot/chunk.rs`
 
-- [ ] **Step 1: Add teloxide-backed sink**
+- [x] **Step 1: Add teloxide-backed sink**
 
 Extend `src/bot/telegram.rs` with this implementation below the trait definitions:
 
@@ -2605,7 +2605,7 @@ impl TelegramSink for TeloxideTelegramSink {
 }
 ```
 
-- [ ] **Step 2: Add chunking test for Telegram limit**
+- [x] **Step 2: Add chunking test for Telegram limit**
 
 Add this test to `src/bot/chunk.rs`:
 
@@ -2623,7 +2623,7 @@ mod telegram_limit_tests {
 }
 ```
 
-- [ ] **Step 3: Run validation**
+- [x] **Step 3: Run validation**
 
 Run:
 
@@ -2633,7 +2633,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 Run:
 
@@ -2651,7 +2651,7 @@ git commit -m "feat: add telegram sink"
 - Create: `.dockerignore`
 - Create: `tests/docker_sandbox.rs`
 
-- [ ] **Step 1: Create Dockerfile**
+- [x] **Step 1: Create Dockerfile**
 
 Create `Dockerfile.sandbox`:
 
@@ -2683,7 +2683,7 @@ ENTRYPOINT ["/usr/local/bin/sandbox-entrypoint.sh"]
 CMD ["sleep", "infinity"]
 ```
 
-- [ ] **Step 2: Create Docker ignore file**
+- [x] **Step 2: Create Docker ignore file**
 
 Create `.dockerignore`:
 
@@ -2694,7 +2694,7 @@ data
 docs/superpowers/plans
 ```
 
-- [ ] **Step 3: Create sandbox entrypoint script**
+- [x] **Step 3: Create sandbox entrypoint script**
 
 Create `scripts/sandbox-entrypoint.sh`:
 
@@ -2724,7 +2724,7 @@ done
 exec "$@"
 ```
 
-- [ ] **Step 4: Add ignored Docker integration tests**
+- [x] **Step 4: Add ignored Docker integration tests**
 
 Create `tests/docker_sandbox.rs`:
 
@@ -2772,7 +2772,7 @@ fn sandbox_should_allow_public_internet() {
 }
 ```
 
-- [ ] **Step 5: Build sandbox image**
+- [x] **Step 5: Build sandbox image**
 
 Run:
 
@@ -2782,7 +2782,7 @@ docker build -f Dockerfile.sandbox -t telellm-sandbox:local .
 
 Expected: image builds and includes `codex`.
 
-- [ ] **Step 6: Run ignored Docker tests manually**
+- [x] **Step 6: Run ignored Docker tests manually**
 
 Run:
 
@@ -2792,7 +2792,7 @@ cargo test --test docker_sandbox -- --ignored
 
 Expected: public internet test passes; private LAN test fails the curl command and passes the assertion.
 
-- [ ] **Step 7: Run validation**
+- [x] **Step 7: Run validation**
 
 Run:
 
@@ -2802,7 +2802,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 Run:
 
@@ -2820,7 +2820,7 @@ git commit -m "feat: add sandbox image"
 - Modify: `src/lib.rs`
 - Modify: `src/app.rs`
 
-- [ ] **Step 1: Export runtime module**
+- [x] **Step 1: Export runtime module**
 
 Add this line to `src/lib.rs`:
 
@@ -2828,7 +2828,7 @@ Add this line to `src/lib.rs`:
 pub mod runtime;
 ```
 
-- [ ] **Step 2: Implement runtime manager**
+- [x] **Step 2: Implement runtime manager**
 
 Replace `src/runtime.rs` with:
 
@@ -2959,7 +2959,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Wire `AppCore` to ensure runtime before routed work**
+- [x] **Step 3: Wire `AppCore` to ensure runtime before routed work**
 
 Modify the `AppCore` struct in `src/app.rs` to include a runtime ensurer:
 
@@ -3044,7 +3044,7 @@ Add the runtime error variant to `AppError`:
 Runtime(#[from] crate::runtime::RuntimeError),
 ```
 
-- [ ] **Step 4: Run validation**
+- [x] **Step 4: Run validation**
 
 Run:
 
@@ -3054,7 +3054,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run:
 
@@ -3070,7 +3070,7 @@ git commit -m "feat: add chat runtime manager"
 **Files:**
 - Modify: `src/bot/telegram.rs`
 
-- [ ] **Step 1: Add incoming message handler and polling loop**
+- [x] **Step 1: Add incoming message handler and polling loop**
 
 Extend `src/bot/telegram.rs` with:
 
@@ -3147,7 +3147,7 @@ fn display_name(user: &User) -> String {
 }
 ```
 
-- [ ] **Step 2: Run validation**
+- [x] **Step 2: Run validation**
 
 Run:
 
@@ -3157,7 +3157,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 Run:
 
@@ -3175,7 +3175,7 @@ git commit -m "feat: add telegram polling adapter"
 - Modify: `src/main.rs`
 - Create: `README.md`
 
-- [ ] **Step 1: Add app handler wrapper**
+- [x] **Step 1: Add app handler wrapper**
 
 Extend `src/app.rs` with:
 
@@ -3198,7 +3198,7 @@ where
 }
 ```
 
-- [ ] **Step 2: Update `src/app.rs` startup**
+- [x] **Step 2: Update `src/app.rs` startup**
 
 Replace `run` in `src/app.rs` with:
 
@@ -3250,7 +3250,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 3: Add README**
+- [x] **Step 3: Add README**
 
 Create `README.md`:
 
@@ -3287,7 +3287,7 @@ cargo run -- --config config.toml
 Each Telegram group maps to a Docker/Colima sandbox and persistent workspace volume. The daemon owns Telegram credentials, durable memory, and long-lived provider credentials. The sandbox receives only scoped access to the host broker and must not receive arbitrary host mounts or the Docker socket.
 ```
 
-- [ ] **Step 4: Run validation**
+- [x] **Step 4: Run validation**
 
 Run:
 
@@ -3297,7 +3297,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run:
 
@@ -3313,7 +3313,13 @@ git commit -m "feat: wire daemon startup"
 **Files:**
 - Modify: `docs/superpowers/plans/2026-04-30-telegram-codex-bridge-implementation.md`
 
-- [ ] **Step 1: Run all checks**
+**Execution notes:**
+- `./scripts/check.sh` passed on 2026-05-01 after the app runtime and sandbox DNS fixes.
+- `docker build -f Dockerfile.sandbox -t telellm-sandbox:local .` passed under Colima on 2026-05-01.
+- `cargo test --test docker_sandbox -- --ignored` passed on 2026-05-01, confirming public egress works while the private LAN probe is rejected.
+- Spec coverage was checked against the approved design: Telegram polling and addressing, per-group routing, SQLite memory, context rendering, Docker sandbox lifecycle, PTY-backed Codex sessions, host broker forwarding, runtime startup, and validation commands are present.
+
+- [x] **Step 1: Run all checks**
 
 Run:
 
@@ -3323,7 +3329,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 2: Run Docker checks when Docker/Colima is available**
+- [x] **Step 2: Run Docker checks when Docker/Colima is available**
 
 Run:
 
@@ -3334,7 +3340,7 @@ cargo test --test docker_sandbox -- --ignored
 
 Expected: image builds, public internet is reachable, private LAN probe is rejected.
 
-- [ ] **Step 3: Confirm spec coverage**
+- [x] **Step 3: Confirm spec coverage**
 
 Check these points manually against `docs/superpowers/specs/2026-04-30-telegram-codex-bridge-design.md`:
 
@@ -3349,7 +3355,7 @@ Check these points manually against `docs/superpowers/specs/2026-04-30-telegram-
 - Runtime manager can ensure a per-chat sandbox and Codex session.
 - Validation commands pass.
 
-- [ ] **Step 4: Commit any final documentation adjustment**
+- [x] **Step 4: Commit any final documentation adjustment**
 
 Run:
 
