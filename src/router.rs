@@ -37,6 +37,10 @@ where
         }
     }
 
+    pub fn telegram(&self) -> Arc<T> {
+        self.telegram.clone()
+    }
+
     pub async fn register_session(&self, chat_id: ChatId, session: Arc<S>) {
         self.sessions.lock().await.insert(chat_id, session);
         self.senders.lock().await.remove(&chat_id);

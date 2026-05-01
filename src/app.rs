@@ -2,7 +2,7 @@ use crate::{
     bot::{
         command::{BotCommand, ForgetTarget},
         message::{Addressing, IncomingMessage},
-        telegram::IncomingMessageHandler,
+        telegram::{IncomingMessageHandler, TelegramError},
     },
     config::AppConfig,
     memory::{MemoryStore, RollingBuffer, context::ContextPacket},
@@ -125,11 +125,11 @@ where
             return Ok(());
         }
 
-        self.runtime.ensure_chat_runtime(message.chat_id).await?;
-
         if let Some(command) = command {
             return self.handle_command(message, command).await;
         }
+
+        self.runtime.ensure_chat_runtime(message.chat_id).await?;
 
         let recent_messages = self.rolling.lock().await.recent_for_chat(message.chat_id);
         let memories = self.memory_store.list_memories(message.chat_id).await?;
@@ -148,12 +148,12 @@ where
     ) -> Result<(), AppError> {
         match command {
             BotCommand::Help => {
-                self.enqueue_text(message.chat_id, help_text()).await?;
+                self.reply_text(message.chat_id, help_text()).await?;
             }
             BotCommand::Status => {
-                self.enqueue_text(
+                self.reply_text(
                     message.chat_id,
-                    "Report concise status for this group's sandbox, Codex session, queue, and memory.",
+                    "Status: host-side status reporting is available. Detailed runtime health will be added in the next implementation task.",
                 )
                 .await?;
             }
@@ -161,40 +161,40 @@ where
                 self.runtime
                     .reset_chat_runtime(message.chat_id, clear_workspace)
                     .await?;
-                self.enqueue_text(message.chat_id, "The group Codex session has been reset.")
+                self.reply_text(message.chat_id, "The group Codex session has been reset.")
                     .await?;
             }
             BotCommand::Restart => {
                 self.runtime.restart_chat_runtime(message.chat_id).await?;
-                self.enqueue_text(message.chat_id, "The group sandbox has been restarted.")
+                self.reply_text(message.chat_id, "The group sandbox has been restarted.")
                     .await?;
             }
             BotCommand::Rebuild { clear_workspace } => {
                 self.runtime
                     .rebuild_chat_runtime(message.chat_id, clear_workspace)
                     .await?;
-                self.enqueue_text(message.chat_id, "The group sandbox has been rebuilt.")
+                self.reply_text(message.chat_id, "The group sandbox has been rebuilt.")
                     .await?;
             }
             BotCommand::Memory => {
                 let memories = self.memory_store.list_memories(message.chat_id).await?;
-                self.enqueue_text(
+                self.reply_text(
                     message.chat_id,
-                    format!("Summarize these durable group memories: {memories:?}"),
+                    format!("Durable group memories: {memories:?}"),
                 )
                 .await?;
             }
             BotCommand::Forget { target } => match target {
                 ForgetTarget::All => {
                     let removed = self.memory_store.forget_all(message.chat_id).await?;
-                    self.enqueue_text(
+                    self.reply_text(
                         message.chat_id,
                         format!("Forgot {removed} durable memory records for this group."),
                     )
                     .await?;
                 }
                 ForgetTarget::Query(query) => {
-                    self.enqueue_text(
+                    self.reply_text(
                         message.chat_id,
                         format!(
                             "Targeted forget was requested for `{query}`. Ask for `/forget all` to clear durable group memory."
@@ -204,6 +204,18 @@ where
                 }
             },
         }
+        Ok(())
+    }
+
+    async fn reply_text(
+        &self,
+        chat_id: crate::ids::ChatId,
+        text: impl AsRef<str>,
+    ) -> Result<(), AppError> {
+        self.router
+            .telegram()
+            .send_message(chat_id, text.as_ref())
+            .await?;
         Ok(())
     }
 
@@ -231,8 +243,18 @@ where
     N: RuntimeControl + 'static,
 {
     async fn handle_message(&self, message: IncomingMessage) {
+        let chat_id = message.chat_id;
         if let Err(err) = AppCore::handle_message(self, message).await {
             tracing::warn!(error = %err, "failed to handle Telegram message");
+            if let Some(text) = user_visible_error(&err)
+                && let Err(send_err) = self.router.telegram().send_message(chat_id, text).await
+            {
+                tracing::warn!(
+                    error = %send_err,
+                    chat_id = ?chat_id,
+                    "failed to send app error to Telegram"
+                );
+            }
         }
     }
 }
@@ -247,10 +269,24 @@ pub enum AppError {
     Router(#[from] RouterError),
     #[error("runtime error: {0}")]
     Runtime(#[from] crate::runtime::RuntimeError),
+    #[error("telegram error: {0}")]
+    Telegram(#[from] TelegramError),
 }
 
 fn help_text() -> &'static str {
     "Show concise help for /status /reset /restart /rebuild /memory /forget."
+}
+
+fn user_visible_error(error: &AppError) -> Option<&'static str> {
+    match error {
+        AppError::Runtime(_) => {
+            Some("I could not start this group's Codex runtime. Check the daemon logs for details.")
+        }
+        AppError::Router(_) => {
+            Some("I could not queue that request for Codex. Check the daemon logs for details.")
+        }
+        AppError::Command(_) | AppError::Memory(_) | AppError::Telegram(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -314,7 +350,46 @@ mod tests {
         let response = messages.recv().await.expect("response should be sent");
 
         assert!(response.contains("Forgot 1 durable memory records"));
-        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn help_should_reply_without_runtime() {
+        let (app, runtime, mut messages) = app_with_fakes().await;
+
+        app.handle_message(incoming("/help"))
+            .await
+            .expect("help should reply");
+
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+        assert!(messages.recv().await.expect("reply").contains("/status"));
+    }
+
+    #[tokio::test]
+    async fn forget_all_should_not_start_codex() {
+        let (app, runtime, mut messages) = app_with_fakes().await;
+
+        app.handle_message(incoming("/forget all"))
+            .await
+            .expect("forget should reply");
+
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+        assert!(messages.recv().await.expect("reply").contains("Forgot"));
+    }
+
+    #[tokio::test]
+    async fn runtime_start_failure_should_send_telegram_error() {
+        let (app, _runtime, mut messages) = app_with_failing_runtime().await;
+
+        IncomingMessageHandler::handle_message(&app, incoming("@telellm_bot hello")).await;
+
+        assert!(
+            messages
+                .recv()
+                .await
+                .expect("reply")
+                .contains("could not start")
+        );
     }
 
     async fn app_with_fakes() -> (
@@ -336,6 +411,17 @@ mod tests {
             router,
             runtime.clone(),
         );
+        (app, runtime, messages)
+    }
+
+    async fn app_with_failing_runtime() -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let (app, _runtime, messages) = app_with_fakes().await;
+        let runtime = app.runtime.clone();
+        runtime.fail_ensure.store(true, Ordering::SeqCst);
         (app, runtime, messages)
     }
 
@@ -420,6 +506,7 @@ mod tests {
     struct FakeRuntime {
         ensure_calls: AtomicUsize,
         reset_calls: AtomicUsize,
+        fail_ensure: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -429,6 +516,11 @@ mod tests {
             _chat_id: ChatId,
         ) -> Result<(), crate::runtime::RuntimeError> {
             self.ensure_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_ensure.load(Ordering::SeqCst) {
+                return Err(crate::runtime::RuntimeError::InvalidBrokerUrl(
+                    "test runtime failure".to_owned(),
+                ));
+            }
             Ok(())
         }
 
