@@ -26,10 +26,10 @@ Open `config.toml` and set the bot username to the username BotFather gave you, 
 ```toml
 [telegram]
 bot_username = "your_bot_username"
-allowed_chat_ids = []
+allowed_chat_ids = [-1001234567890]
 ```
 
-Leave `allowed_chat_ids` empty for this first test group. You will restrict it after the first run.
+Replace the example ID with your test group or DM ID. If you do not know the ID yet, use the discovery flow in [How to configure Telegram access](../how-to/configure-telegram-access.md). Leave `allowed_chat_ids` empty only long enough to discover an ID, then restart with an explicit list.
 
 ## 2. Choose Codex Authentication
 
@@ -76,9 +76,9 @@ cargo run -- doctor --config config.toml --create-network
 
 You should see a `telellm doctor report`. A successful report includes passing checks for config, Telegram auth, Docker, the sandbox image, the Docker network, and `codex --version`. In broker API key mode it also checks the upstream API key environment variable. In ChatGPT OAuth mode it checks the Codex auth file and `codex login status`.
 
-## 5. Add The Bot To A Test Group
+## 5. Add The Bot To A Test Chat
 
-Add the bot to a Telegram group that you control.
+Add the bot to a Telegram group or DM that you control and that is listed in `allowed_chat_ids`.
 
 In BotFather, disable group privacy for the bot if you want ambient group chat to be included in recent context. With privacy enabled, Telegram will generally deliver only commands, mentions, and replies to the bot.
 

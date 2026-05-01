@@ -2,3 +2,7 @@
 /profiles/
 /data/
 /screenlog.*
+/.env
+/.env.*
+/*.pid
+/*.log

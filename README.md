@@ -1,56 +1,85 @@
 # telellm
 
-`telellm` bridges Telegram group chats to sandboxed Codex CLI sessions.
+[![Rust](https://img.shields.io/badge/Rust-2024-orange)](Cargo.toml)
+[![Sandbox](https://img.shields.io/badge/Sandbox-Docker-blue)](Dockerfile.sandbox)
+[![Auth](https://img.shields.io/badge/Auth-ChatGPT%20OAuth%20or%20API%20broker-green)](docs/how-to/configure-codex-auth.md)
+[![License](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
 
-## Documentation
+`telellm` connects Telegram groups and DMs to isolated Codex CLI runtimes.
+Each chat gets its own Docker workspace, queue, memory context, and Codex session.
 
-Start with the documentation map:
+It supports two credential modes:
 
-- [Documentation index](docs/README.md)
-
-The main paths are:
-
-- [Run telellm locally for the first time](docs/tutorials/first-run.md)
-- [How to validate and troubleshoot a setup](docs/how-to/validate-and-troubleshoot.md)
-- [Configuration reference](docs/reference/configuration.md)
-- [Telegram command reference](docs/reference/telegram-commands.md)
-- [Architecture](docs/explanation/architecture.md)
+- `chatgpt_oauth` for Codex CLI access backed by a ChatGPT subscription login.
+- `broker_api_key` for host-held OpenAI API keys with per-chat broker tokens.
 
 ## Quick Start
 
 ```bash
 cp config.example.toml config.toml
-export TELEGRAM_BOT_TOKEN=...
-export OPENAI_API_KEY=...
+export TELEGRAM_BOT_TOKEN="..."
 docker build -f Dockerfile.sandbox -t telellm-sandbox:local .
 cargo run -- doctor --config config.toml --create-network
 cargo run -- run --config config.toml
 ```
 
-The example config uses broker API key mode. To use a ChatGPT/Codex subscription login instead, run `codex login --device-auth` on the host, set `codex.auth_mode = "chatgpt_oauth"` and `codex.auth_host_path` to your host `auth.json`, then remove the need for `OPENAI_API_KEY`.
+For ChatGPT subscription auth, log in on the host and point the config at the Codex auth file:
 
-Use a Telegram test group while bringing the daemon up. Set `allowed_chat_ids` before adding the bot to broader groups.
+```bash
+codex login --device-auth
+```
 
-## Development Checks
+```toml
+[codex]
+auth_mode = "chatgpt_oauth"
+auth_host_path = "/Users/you/.codex/auth.json"
+```
+
+For API-key broker mode, keep the default `auth_mode = "broker_api_key"` and export the upstream key in the daemon environment:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+Set `telegram.allowed_chat_ids` before putting the bot in real groups. An empty allow-list accepts every chat that can reach the bot.
+
+## What It Does
+
+- Routes Telegram mentions, replies, slash commands, and DMs into Codex.
+- Keeps one persistent Docker workspace volume per Telegram chat.
+- Stores durable group memory in SQLite and rolling recent context in memory.
+- Lets groups manage their own runtime with `/status`, `/reset`, `/restart`, and `/rebuild`.
+- Keeps the Docker socket and host secrets out of normal sandbox mounts.
+
+## Documentation
+
+Start here:
+
+- [First run tutorial](docs/tutorials/first-run.md)
+- [Telegram access setup](docs/how-to/configure-telegram-access.md)
+- [Codex authentication setup](docs/how-to/configure-codex-auth.md)
+- [Runtime troubleshooting](docs/how-to/validate-and-troubleshoot.md)
+- [Configuration reference](docs/reference/configuration.md)
+- [Runtime and security model](docs/explanation/runtime-and-security.md)
+
+The full documentation map is in [docs/README.md](docs/README.md).
+
+## Development
 
 ```bash
 ./scripts/check.sh
+cargo audit
 ```
 
-The script runs formatting, tests, and Clippy:
+`scripts/check.sh` runs `cargo fmt --check`, `cargo test`, and Clippy with warnings denied.
 
-```bash
-cargo fmt --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-```
+## Security
 
-## Security Model
+Read [SECURITY.md](SECURITY.md) before exposing a daemon to shared groups.
 
-Each Telegram group maps to a Docker/Colima sandbox and persistent workspace volume. In broker API key mode, the daemon owns Telegram credentials, durable memory, broker tokens, and the upstream provider credential. In ChatGPT OAuth mode, the sandbox receives a copied Codex auth file for subscription-backed Codex CLI use. The Docker socket is never mounted.
+The short version:
 
-Read the full model in:
-
-- [Runtime and security model](docs/explanation/runtime-and-security.md)
-- [Sandbox reference](docs/reference/sandbox.md)
-- [Broker reference](docs/reference/broker.md)
+- Keep `profiles/`, `.env`, and local data out of git and Docker build contexts.
+- Use explicit `allowed_chat_ids` outside of temporary setup.
+- Treat everyone in an allowed Telegram chat as able to control that chat's sandbox.
+- Use `chatgpt_oauth` only for chats trusted with the copied Codex subscription auth inside their sandbox.

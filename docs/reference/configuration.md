@@ -10,7 +10,7 @@ The example config is `config.example.toml`.
 | --- | --- | --- | --- | --- |
 | `bot_token_env` | string | yes | `TELEGRAM_BOT_TOKEN` | Environment variable containing the Telegram bot token. |
 | `bot_username` | string | yes | `telellm_bot` | Bot username used for mentions and addressed commands. |
-| `allowed_chat_ids` | array of integers | no | `[]` | Chat allow-list. Empty means all chats are allowed. |
+| `allowed_chat_ids` | array of integers | no | `[-1001234567890]` | Chat allow-list. Empty means all chats are allowed. |
 
 `bot_token_env` and `bot_username` must not be empty.
 
@@ -46,7 +46,7 @@ All three fields must not be empty.
 | --- | --- | --- | --- | --- |
 | `command` | string | yes | `codex` | Command executed inside the sandbox container. |
 | `args` | array of strings | no | `["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]` | Extra arguments placed before `--model` and `--cd`. When the first argument is `exec`, the runtime uses non-interactive `codex exec` and returns only the final message. |
-| `model` | string | yes | `gpt-5.5` | Model passed to Codex with `--model`. In `chatgpt_oauth` mode, use a model available to the ChatGPT account. |
+| `model` | string | yes | `gpt-5-codex` | Model passed to Codex with `--model`. In `chatgpt_oauth` mode, use a model available to the ChatGPT account. |
 | `auth_mode` | string | no | `broker_api_key` | Codex credential strategy. Valid values are `broker_api_key` and `chatgpt_oauth`. |
 | `auth_host_path` | path | when `auth_mode = "chatgpt_oauth"` | unset | Absolute host path to Codex CLI `auth.json`. |
 | `env` | map of strings | no | `{}` | Parsed by config. It is not currently applied by the runtime. |

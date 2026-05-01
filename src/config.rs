@@ -508,7 +508,7 @@ mod tests {
             args = ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]
             model = "gpt-5-codex"
             auth_mode = "chatgpt_oauth"
-            auth_host_path = "/Users/michaelasper/.codex/auth.json"
+            auth_host_path = "/home/user/.codex/auth.json"
         "#;
 
         let config = AppConfig::from_toml_str(raw).expect("config should parse");

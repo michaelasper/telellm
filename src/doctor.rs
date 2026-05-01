@@ -546,7 +546,7 @@ mod tests {
         let args = codex_auth_probe_args(
             "telellm-sandbox:local",
             "telellm_public",
-            Path::new("/Users/michaelasper/.codex/auth.json"),
+            Path::new("/home/user/.codex/auth.json"),
         );
 
         assert!(
@@ -554,8 +554,7 @@ mod tests {
                 .any(|window| window == ["--network", "telellm_public"])
         );
         assert!(args.windows(2).any(|window| window[0] == "-v"
-            && window[1]
-                == "/Users/michaelasper/.codex/auth.json:/run/telellm/codex-auth.json:ro"));
+            && window[1] == "/home/user/.codex/auth.json:/run/telellm/codex-auth.json:ro"));
         assert!(args.ends_with(&["codex".to_owned(), "login".to_owned(), "status".to_owned()]));
     }
 

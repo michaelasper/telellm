@@ -258,20 +258,19 @@ mod tests {
     fn run_args_should_mount_codex_auth_file_for_chatgpt_oauth() {
         let mut spec =
             SandboxSpec::new(ChatId(1), "telellm-sandbox:local", "telellm_public", "vol");
-        spec.codex_auth_host_path = Some("/Users/michaelasper/.codex/auth.json".into());
+        spec.codex_auth_host_path = Some("/home/user/.codex/auth.json".into());
 
         let args = DockerSandboxBackend::run_args(&spec);
 
         assert!(args.windows(2).any(|window| window[0] == "-v"
-            && window[1]
-                == "/Users/michaelasper/.codex/auth.json:/run/telellm/codex-auth.json:ro"));
+            && window[1] == "/home/user/.codex/auth.json:/run/telellm/codex-auth.json:ro"));
     }
 
     #[test]
     fn run_args_should_not_set_broker_env_for_chatgpt_oauth() {
         let mut spec =
             SandboxSpec::new(ChatId(1), "telellm-sandbox:local", "telellm_public", "vol");
-        spec.codex_auth_host_path = Some("/Users/michaelasper/.codex/auth.json".into());
+        spec.codex_auth_host_path = Some("/home/user/.codex/auth.json".into());
 
         let args = DockerSandboxBackend::run_args(&spec);
 

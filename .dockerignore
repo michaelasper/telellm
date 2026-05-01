@@ -1,4 +1,10 @@
 .git
 target
 data
-docs/superpowers/plans
+profiles
+screenlog.*
+*.pid
+*.log
+.env
+.env.*
+docs/superpowers

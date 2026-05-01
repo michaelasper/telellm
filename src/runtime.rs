@@ -675,7 +675,7 @@ mod tests {
     fn spec_for_chat_should_mount_codex_auth_for_chatgpt_oauth_without_broker_config() {
         let (docker, mut codex, _broker) = configs();
         codex.auth_mode = CodexAuthMode::ChatgptOauth;
-        codex.auth_host_path = Some(PathBuf::from("/Users/michaelasper/.codex/auth.json"));
+        codex.auth_host_path = Some(PathBuf::from("/home/user/.codex/auth.json"));
         let (_telegram, router) = fake_runtime_router();
         let manager = RuntimeManager::new(
             DockerSandboxBackend,
@@ -690,7 +690,7 @@ mod tests {
 
         assert_eq!(
             spec.codex_auth_host_path,
-            Some(PathBuf::from("/Users/michaelasper/.codex/auth.json"))
+            Some(PathBuf::from("/home/user/.codex/auth.json"))
         );
     }
 
@@ -769,7 +769,7 @@ mod tests {
     fn chatgpt_oauth_first_process_auth_state_should_recreate_sandbox() {
         let (docker, mut codex, _broker) = configs();
         codex.auth_mode = CodexAuthMode::ChatgptOauth;
-        codex.auth_host_path = Some(PathBuf::from("/Users/michaelasper/.codex/auth.json"));
+        codex.auth_host_path = Some(PathBuf::from("/home/user/.codex/auth.json"));
         let (_telegram, router) = fake_runtime_router();
         let manager = RuntimeManager::new(
             DockerSandboxBackend,

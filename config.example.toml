@@ -1,7 +1,9 @@
 [telegram]
 bot_token_env = "TELEGRAM_BOT_TOKEN"
 bot_username = "telellm_bot"
-allowed_chat_ids = []
+# Replace with the Telegram group or DM IDs allowed to use this daemon.
+# Empty means every chat that reaches the bot is allowed.
+allowed_chat_ids = [-1001234567890]
 
 [prompt]
 system_prompt = """
@@ -19,7 +21,7 @@ workspace_volume_prefix = "telellm_workspace"
 
 [codex]
 command = "codex"
-args = ["--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"]
+args = ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]
 model = "gpt-5-codex"
 # Broker API key mode is the default and keeps the upstream provider key on the host.
 auth_mode = "broker_api_key"

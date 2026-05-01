@@ -29,8 +29,10 @@ impl IncomingMessage {
 
 fn mentions_bot(text: &str, bot_username: &str) -> bool {
     let mention = format!("@{}", bot_username.trim_start_matches('@'));
-    text.split_whitespace()
-        .any(|word| word.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '@') == mention)
+    text.split_whitespace().any(|word| {
+        word.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '@')
+            .eq_ignore_ascii_case(&mention)
+    })
 }
 
 #[cfg(test)]
@@ -52,6 +54,13 @@ mod tests {
     #[test]
     fn addressing_should_detect_bot_mention() {
         let msg = message("hey @telellm_bot what do you think?");
+
+        assert_eq!(msg.addressing("telellm_bot"), Addressing::Addressed);
+    }
+
+    #[test]
+    fn addressing_should_detect_bot_mention_case_insensitively() {
+        let msg = message("hey @TeleLLM_Bot what do you think?");
 
         assert_eq!(msg.addressing("telellm_bot"), Addressing::Addressed);
     }
