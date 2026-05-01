@@ -1,6 +1,6 @@
 use crate::{
     bot::telegram::TelegramSink,
-    codex::pty::PtyCodexSession,
+    codex::pty::{PtyCodexSession, PtyReadPolicy},
     config::{BrokerConfig, CodexConfig, DockerConfig},
     ids::ChatId,
     router::Router,
@@ -38,6 +38,7 @@ where
     docker_config: DockerConfig,
     codex_config: CodexConfig,
     broker_config: BrokerConfig,
+    read_policy: PtyReadPolicy,
     router: Arc<Router<PtyCodexSession, T>>,
     registered: Mutex<HashSet<ChatId>>,
     startup_locks: Mutex<HashMap<ChatId, Arc<Mutex<()>>>>,
@@ -53,16 +54,23 @@ where
         codex_config: CodexConfig,
         broker_config: BrokerConfig,
         router: Arc<Router<PtyCodexSession, T>>,
+        read_policy: PtyReadPolicy,
     ) -> Self {
         Self {
             docker,
             docker_config,
             codex_config,
             broker_config,
+            read_policy,
             router,
             registered: Mutex::new(HashSet::new()),
             startup_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn read_policy_for_test(&self) -> &PtyReadPolicy {
+        &self.read_policy
     }
 
     fn spec_for_chat(&self, chat_id: ChatId) -> Result<SandboxSpec, RuntimeError> {
@@ -104,7 +112,11 @@ where
         ]);
 
         let docker_args = DockerSandboxBackend::exec_args(spec, &codex_parts);
-        let session = Arc::new(PtyCodexSession::spawn("docker", &docker_args)?);
+        let session = Arc::new(PtyCodexSession::spawn_with_read_policy(
+            "docker",
+            &docker_args,
+            self.read_policy.clone(),
+        )?);
         self.router.register_session(spec.chat_id, session).await;
         self.registered.lock().await.insert(spec.chat_id);
         Ok(())
@@ -235,7 +247,10 @@ pub enum RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrokerConfig, CodexConfig, DockerConfig};
+    use crate::config::{
+        AppConfig, BrokerConfig, CodexConfig, DockerConfig, LimitsConfig, StorageConfig,
+        TelegramConfig, codex_read_policy,
+    };
     use std::{
         collections::BTreeMap,
         sync::{
@@ -280,6 +295,7 @@ mod tests {
             codex,
             broker,
             Arc::new(router),
+            PtyReadPolicy::default(),
         );
 
         let spec = manager.spec_for_chat(ChatId(1)).expect("spec should build");
@@ -297,6 +313,7 @@ mod tests {
             codex,
             broker,
             Arc::new(router),
+            PtyReadPolicy::default(),
         );
         let spec = manager.spec_for_chat(ChatId(1)).expect("spec should build");
         let mut parts = Vec::new();
@@ -312,6 +329,55 @@ mod tests {
         let args = DockerSandboxBackend::exec_args(&spec, &parts);
 
         assert!(args.contains(&"gpt-5-codex".to_owned()));
+    }
+
+    #[test]
+    fn codex_session_should_use_configured_inactivity_timeout() {
+        let (docker, codex, broker) = configs();
+        let config = AppConfig {
+            telegram: TelegramConfig {
+                bot_token_env: "TELEGRAM_BOT_TOKEN".to_owned(),
+                bot_username: "telellm_bot".to_owned(),
+            },
+            storage: StorageConfig {
+                sqlite_path: "data/telellm.sqlite".into(),
+            },
+            docker: docker.clone(),
+            codex: codex.clone(),
+            broker: broker.clone(),
+            limits: LimitsConfig {
+                codex_first_byte_timeout_secs: 13,
+                codex_inactivity_secs: 17,
+                codex_max_turn_secs: 19,
+                codex_max_output_bytes: 23,
+                ..LimitsConfig::default()
+            },
+        };
+        let read_policy = codex_read_policy(&config);
+        let (_telegram, router) = fake_runtime_router();
+
+        let manager = RuntimeManager::new(
+            DockerSandboxBackend,
+            docker,
+            codex,
+            broker,
+            Arc::new(router),
+            read_policy,
+        );
+
+        assert_eq!(
+            manager.read_policy_for_test().inactivity_timeout,
+            Duration::from_secs(17)
+        );
+        assert_eq!(
+            manager.read_policy_for_test().first_byte_timeout,
+            Duration::from_secs(13)
+        );
+        assert_eq!(
+            manager.read_policy_for_test().max_turn_timeout,
+            Duration::from_secs(19)
+        );
+        assert_eq!(manager.read_policy_for_test().max_output_bytes, 23);
     }
 
     #[tokio::test]
@@ -438,6 +504,7 @@ mod tests {
             codex,
             broker,
             Arc::new(router),
+            PtyReadPolicy::default(),
         )
     }
 

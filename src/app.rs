@@ -66,6 +66,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         config.codex.clone(),
         config.broker.clone(),
         router.clone(),
+        crate::config::codex_read_policy(&config),
     ));
     let app_core = Arc::new(AppCore::new(
         config.telegram.bot_username.clone(),

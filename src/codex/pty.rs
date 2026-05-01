@@ -18,7 +18,7 @@ pub struct PtyCodexSession {
     inner: Arc<Mutex<PtyInner>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtyReadPolicy {
     pub first_byte_timeout: Duration,
     pub inactivity_timeout: Duration,

@@ -57,8 +57,14 @@ pub struct LimitsConfig {
     pub telegram_chunk_chars: usize,
     #[serde(default = "default_recent_buffer_messages")]
     pub recent_buffer_messages: usize,
+    #[serde(default = "default_codex_first_byte_timeout_secs")]
+    pub codex_first_byte_timeout_secs: u64,
     #[serde(default = "default_codex_inactivity_secs")]
     pub codex_inactivity_secs: u64,
+    #[serde(default = "default_codex_max_turn_secs")]
+    pub codex_max_turn_secs: u64,
+    #[serde(default = "default_codex_max_output_bytes")]
+    pub codex_max_output_bytes: usize,
 }
 
 impl Default for LimitsConfig {
@@ -67,7 +73,10 @@ impl Default for LimitsConfig {
             per_group_queue_depth: default_queue_depth(),
             telegram_chunk_chars: default_telegram_chunk_chars(),
             recent_buffer_messages: default_recent_buffer_messages(),
+            codex_first_byte_timeout_secs: default_codex_first_byte_timeout_secs(),
             codex_inactivity_secs: default_codex_inactivity_secs(),
+            codex_max_turn_secs: default_codex_max_turn_secs(),
+            codex_max_output_bytes: default_codex_max_output_bytes(),
         }
     }
 }
@@ -116,6 +125,25 @@ impl AppConfig {
             });
         }
 
+        require_positive_u64(
+            "limits.codex_first_byte_timeout_secs",
+            self.limits.codex_first_byte_timeout_secs,
+        )?;
+        require_positive_u64(
+            "limits.codex_inactivity_secs",
+            self.limits.codex_inactivity_secs,
+        )?;
+        require_positive_u64(
+            "limits.codex_max_turn_secs",
+            self.limits.codex_max_turn_secs,
+        )?;
+        if self.limits.codex_max_output_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "limits.codex_max_output_bytes",
+                reason: "must be greater than zero",
+            });
+        }
+
         Ok(())
     }
 
@@ -154,8 +182,27 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), ConfigError
     Ok(())
 }
 
+fn require_positive_u64(field: &'static str, value: u64) -> Result<(), ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::InvalidValue {
+            field,
+            reason: "must be greater than zero",
+        });
+    }
+    Ok(())
+}
+
 pub fn codex_inactivity_timeout(config: &AppConfig) -> Duration {
     Duration::from_secs(config.limits.codex_inactivity_secs)
+}
+
+pub fn codex_read_policy(config: &AppConfig) -> crate::codex::pty::PtyReadPolicy {
+    crate::codex::pty::PtyReadPolicy {
+        first_byte_timeout: Duration::from_secs(config.limits.codex_first_byte_timeout_secs),
+        inactivity_timeout: Duration::from_secs(config.limits.codex_inactivity_secs),
+        max_turn_timeout: Duration::from_secs(config.limits.codex_max_turn_secs),
+        max_output_bytes: config.limits.codex_max_output_bytes,
+    }
 }
 
 fn default_queue_depth() -> usize {
@@ -170,8 +217,20 @@ fn default_recent_buffer_messages() -> usize {
     200
 }
 
+fn default_codex_first_byte_timeout_secs() -> u64 {
+    300
+}
+
 fn default_codex_inactivity_secs() -> u64 {
     600
+}
+
+fn default_codex_max_turn_secs() -> u64 {
+    900
+}
+
+fn default_codex_max_output_bytes() -> usize {
+    512 * 1024
 }
 
 #[cfg(test)]
@@ -229,5 +288,37 @@ mod tests {
         let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
 
         assert_eq!(config.limits.per_group_queue_depth, 16);
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_zero_codex_inactivity_secs() {
+        let raw = format!("{}\n[limits]\ncodex_inactivity_secs = 0\n", valid_config());
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `limits.codex_inactivity_secs` is invalid: must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn codex_read_policy_should_use_configured_limits() {
+        let raw = format!(
+            "{}\n[limits]\n\
+            codex_first_byte_timeout_secs = 11\n\
+            codex_inactivity_secs = 7\n\
+            codex_max_turn_secs = 29\n\
+            codex_max_output_bytes = 12345\n",
+            valid_config()
+        );
+        let config = AppConfig::from_toml_str(&raw).expect("config should parse");
+
+        let policy = codex_read_policy(&config);
+
+        assert_eq!(policy.first_byte_timeout, Duration::from_secs(11));
+        assert_eq!(policy.inactivity_timeout, Duration::from_secs(7));
+        assert_eq!(policy.max_turn_timeout, Duration::from_secs(29));
+        assert_eq!(policy.max_output_bytes, 12345);
     }
 }

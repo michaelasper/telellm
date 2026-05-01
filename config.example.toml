@@ -25,4 +25,7 @@ upstream_api_key_env = "OPENAI_API_KEY"
 per_group_queue_depth = 16
 telegram_chunk_chars = 3900
 recent_buffer_messages = 200
+codex_first_byte_timeout_secs = 300
 codex_inactivity_secs = 600
+codex_max_turn_secs = 900
+codex_max_output_bytes = 524288
