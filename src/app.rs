@@ -247,12 +247,23 @@ where
         chat_id: crate::ids::ChatId,
         prompt: impl Into<String>,
     ) -> Result<(), AppError> {
-        self.router
+        let receipt = self
+            .router
             .enqueue(GroupWorkItem {
                 chat_id,
                 prompt: prompt.into(),
             })
             .await?;
+        if receipt.queue_position > 0 {
+            self.reply_text(
+                chat_id,
+                format!(
+                    "Queued behind {} existing request(s).",
+                    receipt.queue_position
+                ),
+            )
+            .await?;
+        }
         Ok(())
     }
 }
@@ -346,7 +357,10 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use tokio::sync::mpsc;
+    use tokio::{
+        sync::mpsc,
+        time::{Duration, timeout},
+    };
 
     fn incoming(text: &str) -> IncomingMessage {
         IncomingMessage {
@@ -464,6 +478,43 @@ mod tests {
         assert!(reply.contains("docker unavailable"));
         assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn addressed_message_should_acknowledge_long_running_turn() {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, mut messages) = FakeTelegram::new();
+        let router = Arc::new(Router::new(4, telegram));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let codex = Arc::new(BlockingCodexSession::new(entered_tx));
+        router.register_session(ChatId(1), 1, codex.clone()).await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let app = AppCore::new(
+            "telellm_bot".to_owned(),
+            Vec::new(),
+            memory,
+            RollingBuffer::new(10),
+            router,
+            runtime,
+        );
+
+        app.handle_message(incoming("@telellm_bot first"))
+            .await
+            .expect("first addressed message should be handled");
+        timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("first Codex turn should start")
+            .expect("blocking session should report the first prompt");
+
+        app.handle_message(incoming("@telellm_bot second"))
+            .await
+            .expect("second addressed message should be handled");
+        let ack = timeout(Duration::from_secs(1), messages.recv())
+            .await
+            .expect("queued acknowledgement should arrive")
+            .expect("telegram sender should stay open");
+
+        assert_eq!(ack, "Queued behind 1 existing request(s).");
     }
 
     #[tokio::test]
@@ -602,6 +653,38 @@ mod tests {
     impl CodexSession for FakeCodexSession {
         async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
             self.prompts.fetch_add(1, Ordering::SeqCst);
+            Ok(CodexTurn {
+                output: request.prompt,
+            })
+        }
+
+        async fn restart(&self) -> Result<(), CodexSessionError> {
+            Ok(())
+        }
+    }
+
+    struct BlockingCodexSession {
+        entered: mpsc::UnboundedSender<String>,
+        release: tokio::sync::Notify,
+    }
+
+    impl BlockingCodexSession {
+        fn new(entered: mpsc::UnboundedSender<String>) -> Self {
+            Self {
+                entered,
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CodexSession for BlockingCodexSession {
+        async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
+            self.entered
+                .send(request.prompt.clone())
+                .map_err(|err| CodexSessionError::Pty(err.to_string()))?;
+            self.release.notified().await;
+
             Ok(CodexTurn {
                 output: request.prompt,
             })

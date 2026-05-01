@@ -3,13 +3,25 @@ use crate::{
     codex::session::{CodexRequest, CodexSession, CodexSessionError},
     ids::ChatId,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tokio::sync::{Mutex, mpsc};
 
 #[derive(Debug, Clone)]
 pub struct GroupWorkItem {
     pub chat_id: ChatId,
     pub prompt: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnqueueReceipt {
+    pub chat_id: ChatId,
+    pub queue_position: usize,
 }
 
 pub struct Router<S, T>
@@ -41,6 +53,29 @@ impl<S> Clone for RegisteredSession<S> {
 struct WorkerSender {
     generation: u64,
     sender: mpsc::Sender<GroupWorkItem>,
+    state: Arc<WorkerState>,
+}
+
+#[derive(Default)]
+struct WorkerState {
+    active_items: AtomicUsize,
+}
+
+impl WorkerState {
+    fn begin_item(&self) {
+        self.active_items.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn finish_item(&self) {
+        self.active_items.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl WorkerSender {
+    fn queue_position(&self, queue_depth: usize) -> usize {
+        let buffered_items = queue_depth.saturating_sub(self.sender.capacity());
+        buffered_items + self.state.active_items.load(Ordering::SeqCst)
+    }
 }
 
 impl<S, T> Router<S, T>
@@ -72,18 +107,23 @@ where
         self.senders.lock().await.remove(&chat_id);
     }
 
-    pub async fn enqueue(&self, item: GroupWorkItem) -> Result<(), RouterError> {
+    pub async fn enqueue(&self, item: GroupWorkItem) -> Result<EnqueueReceipt, RouterError> {
+        let chat_id = item.chat_id;
         let sender = self.sender_for_chat(item.chat_id).await?;
+        let queue_position = sender.queue_position(self.queue_depth);
         sender
+            .sender
             .send(item)
             .await
-            .map_err(|_| RouterError::QueueClosed)
+            .map_err(|_| RouterError::QueueClosed)?;
+
+        Ok(EnqueueReceipt {
+            chat_id,
+            queue_position,
+        })
     }
 
-    async fn sender_for_chat(
-        &self,
-        chat_id: ChatId,
-    ) -> Result<mpsc::Sender<GroupWorkItem>, RouterError> {
+    async fn sender_for_chat(&self, chat_id: ChatId) -> Result<WorkerSender, RouterError> {
         let registered = self
             .sessions
             .lock()
@@ -95,29 +135,30 @@ where
         let mut senders = self.senders.lock().await;
         if let Some(sender) = senders.get(&chat_id).cloned() {
             if sender.generation == registered.generation {
-                return Ok(sender.sender);
+                return Ok(sender);
             }
             senders.remove(&chat_id);
         }
 
         let telegram = self.telegram.clone();
         let (tx, rx) = mpsc::channel(self.queue_depth);
+        let state = Arc::new(WorkerState::default());
         Self::spawn_chat_worker(
             registered.session,
             registered.generation,
             self.sessions.clone(),
             telegram,
+            state.clone(),
             rx,
         );
 
-        senders.insert(
-            chat_id,
-            WorkerSender {
-                generation: registered.generation,
-                sender: tx.clone(),
-            },
-        );
-        Ok(tx)
+        let sender = WorkerSender {
+            generation: registered.generation,
+            sender: tx,
+            state,
+        };
+        senders.insert(chat_id, sender.clone());
+        Ok(sender)
     }
 
     fn spawn_chat_worker(
@@ -125,6 +166,7 @@ where
         generation: u64,
         sessions: Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
         telegram: Arc<T>,
+        state: Arc<WorkerState>,
         mut rx: mpsc::Receiver<GroupWorkItem>,
     ) {
         tokio::spawn(async move {
@@ -134,9 +176,11 @@ where
                     break;
                 }
 
+                state.begin_item();
                 let result = session.send(CodexRequest { prompt }).await;
 
                 if Self::worker_is_stale(&sessions, chat_id, generation).await {
+                    state.finish_item();
                     break;
                 }
 
@@ -161,6 +205,7 @@ where
                         }
                     }
                 }
+                state.finish_item();
             }
         });
     }
@@ -358,6 +403,34 @@ mod tests {
         let _second_message = receive_message(&mut messages).await;
 
         assert_eq!(session.max_active_sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_should_report_queue_position_when_busy() {
+        let (telegram, _messages) = fake_telegram();
+        let session = Arc::new(SlowSession::new("reply"));
+        let router = Router::new(4, telegram);
+        router.register_session(ChatId(1), 1, session.clone()).await;
+
+        let first_entered = session.entered.notified();
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "one".to_owned(),
+            })
+            .await
+            .expect("first enqueue should work");
+        first_entered.await;
+
+        let receipt = router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "two".to_owned(),
+            })
+            .await
+            .expect("second enqueue should work");
+
+        assert_eq!(receipt.queue_position, 1);
     }
 
     #[tokio::test]

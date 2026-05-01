@@ -1,11 +1,14 @@
 use crate::ids::ChatId;
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use teloxide::{
     dispatching::UpdateFilterExt,
+    errors::AsResponseParameters,
     prelude::*,
     types::{Message, User},
 };
+
+const RETRY_AFTER_BUFFER: Duration = Duration::from_millis(250);
 
 #[async_trait]
 pub trait TelegramSink: Send + Sync {
@@ -29,19 +32,68 @@ impl TeloxideTelegramSink {
     pub fn new(bot: Bot, chunk_limit: usize) -> Self {
         Self { bot, chunk_limit }
     }
+
+    async fn send_chunk_with_retry(
+        &self,
+        chat_id: ChatId,
+        chunk: &str,
+    ) -> Result<(), TelegramError> {
+        match self.send_chunk(chat_id, chunk).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let Some(retry_after) = retry_after_duration(&err) else {
+                    return Err(telegram_send_error(err));
+                };
+
+                tokio::time::sleep(retry_after + RETRY_AFTER_BUFFER).await;
+                self.send_chunk(chat_id, chunk)
+                    .await
+                    .map_err(telegram_send_error)
+            }
+        }
+    }
+
+    async fn send_chunk(&self, chat_id: ChatId, chunk: &str) -> Result<(), teloxide::RequestError> {
+        self.bot
+            .send_message(teloxide::types::ChatId(chat_id.0), chunk)
+            .await
+            .map(|_| ())
+    }
 }
 
 #[async_trait]
 impl TelegramSink for TeloxideTelegramSink {
     async fn send_message(&self, chat_id: ChatId, text: &str) -> Result<(), TelegramError> {
         for chunk in crate::bot::chunk::chunk_for_telegram(text, self.chunk_limit) {
-            self.bot
-                .send_message(teloxide::types::ChatId(chat_id.0), chunk)
-                .await
-                .map_err(|err| TelegramError::Send(err.to_string()))?;
+            self.send_chunk_with_retry(chat_id, &chunk).await?;
         }
         Ok(())
     }
+}
+
+fn telegram_send_error(err: teloxide::RequestError) -> TelegramError {
+    TelegramError::Send(err.to_string())
+}
+
+fn retry_after_duration(err: &teloxide::RequestError) -> Option<Duration> {
+    err.retry_after()
+        .map(|seconds| seconds.duration())
+        .or_else(|| parse_retry_after_duration(&err.to_string()))
+}
+
+fn parse_retry_after_duration(text: &str) -> Option<Duration> {
+    // Structured teloxide retry-after errors are preferred. This fallback only
+    // handles display strings containing the narrow phrase "retry after <seconds>".
+    let lower = text.to_ascii_lowercase();
+    let (_, tail) = lower.split_once("retry after")?;
+    let digits: String = tail
+        .trim_start_matches(|ch: char| !ch.is_ascii_digit())
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+
+    let seconds = digits.parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 #[async_trait]
@@ -104,5 +156,21 @@ fn display_name(user: &User) -> String {
     match &user.last_name {
         Some(last_name) => format!("{} {}", user.first_name, last_name),
         None => user.first_name.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn retry_after_parser_should_extract_seconds() {
+        let error = "Telegram error: Too Many Requests: retry after 7";
+
+        assert_eq!(
+            parse_retry_after_duration(error),
+            Some(Duration::from_secs(7))
+        );
     }
 }
