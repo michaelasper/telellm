@@ -106,6 +106,8 @@ If Telegram edit rate limits appear in logs, increase `streaming_update_interval
 
 If formatted responses are rejected by Telegram, keep `formatting_fallback_to_plain = true`. Use `formatting_escape = true` for arbitrary model output, and disable it only when the system prompt asks Codex to produce valid Telegram `markdown_v2` or `html`.
 
+If slash commands such as `/remember` do not appear in the Telegram command menu, restart the daemon so it can register commands again, then reopen the Telegram chat to clear the client cache.
+
 ## Known Doctor Limits
 
 The doctor does not currently verify Telegram API reachability, SQLite write permissions, or that the bot is present in a specific group.

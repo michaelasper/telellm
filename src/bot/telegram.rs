@@ -9,7 +9,10 @@ use teloxide::{
     errors::AsResponseParameters,
     payloads::{EditMessageTextSetters, SendMessageSetters},
     prelude::*,
-    types::{ChatAction, ChatId as TgChatId, Message, MessageId as TgMessageId, ParseMode, User},
+    types::{
+        BotCommand as TgBotCommand, ChatAction, ChatId as TgChatId, Message,
+        MessageId as TgMessageId, ParseMode, User,
+    },
     utils::{html, markdown},
 };
 
@@ -88,6 +91,8 @@ pub enum TelegramError {
     Edit(String),
     #[error("telegram chat action failed: {0}")]
     ChatAction(String),
+    #[error("telegram command registration failed: {0}")]
+    CommandRegistration(String),
 }
 
 pub struct TelegramAdapter;
@@ -370,6 +375,8 @@ pub async fn run_polling(
     bot_username: String,
     handler: Arc<dyn IncomingMessageHandler>,
 ) -> Result<(), TelegramError> {
+    register_bot_commands(&bot).await?;
+
     let handler_filter = Update::filter_message().endpoint(move |msg: Message| {
         let handler = handler.clone();
         let bot_username = bot_username.clone();
@@ -387,6 +394,20 @@ pub async fn run_polling(
         .dispatch()
         .await;
     Ok(())
+}
+
+async fn register_bot_commands(bot: &Bot) -> Result<(), TelegramError> {
+    bot.set_my_commands(telegram_command_menu())
+        .await
+        .map(|_| ())
+        .map_err(|err| TelegramError::CommandRegistration(err.to_string()))
+}
+
+fn telegram_command_menu() -> Vec<TgBotCommand> {
+    crate::bot::command::command_definitions()
+        .iter()
+        .map(|definition| TgBotCommand::new(definition.command, definition.description))
+        .collect()
 }
 
 fn normalize_message(
@@ -469,5 +490,14 @@ mod tests {
 
         assert_eq!(text, "hi *there*");
         assert_eq!(parse_mode, None);
+    }
+
+    #[test]
+    fn telegram_command_menu_should_include_remember() {
+        let has_remember = telegram_command_menu()
+            .into_iter()
+            .any(|command| command.command == "remember");
+
+        assert!(has_remember);
     }
 }

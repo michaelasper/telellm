@@ -16,6 +16,47 @@ pub enum ForgetTarget {
     Query(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandDefinition {
+    pub command: &'static str,
+    pub description: &'static str,
+}
+
+pub const COMMAND_DEFINITIONS: &[CommandDefinition] = &[
+    CommandDefinition {
+        command: "help",
+        description: "Show command help.",
+    },
+    CommandDefinition {
+        command: "status",
+        description: "Show this chat's Codex runtime status.",
+    },
+    CommandDefinition {
+        command: "reset",
+        description: "Reset this chat's Codex session.",
+    },
+    CommandDefinition {
+        command: "restart",
+        description: "Restart this chat's sandbox.",
+    },
+    CommandDefinition {
+        command: "rebuild",
+        description: "Recreate this chat's sandbox container.",
+    },
+    CommandDefinition {
+        command: "memory",
+        description: "List durable group memories.",
+    },
+    CommandDefinition {
+        command: "remember",
+        description: "Store a durable group memory.",
+    },
+    CommandDefinition {
+        command: "forget",
+        description: "Forget durable group memories.",
+    },
+];
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CommandParseError {
     #[error("unknown command `{0}`")]
@@ -86,6 +127,10 @@ impl BotCommand {
     }
 }
 
+pub fn command_definitions() -> &'static [CommandDefinition] {
+    COMMAND_DEFINITIONS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +182,37 @@ mod tests {
                 content: "Mike likes short answers".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn command_definitions_should_include_supported_commands() {
+        let commands: Vec<_> = command_definitions()
+            .iter()
+            .map(|definition| definition.command)
+            .collect();
+
+        assert_eq!(
+            commands,
+            vec![
+                "help", "status", "reset", "restart", "rebuild", "memory", "remember", "forget"
+            ]
+        );
+    }
+
+    #[test]
+    fn command_definitions_should_be_valid_for_telegram_menu() {
+        for definition in command_definitions() {
+            assert!(!definition.command.starts_with('/'));
+            assert!(!definition.command.is_empty());
+            assert!(definition.command.len() <= 32);
+            assert!(definition.description.len() >= 3);
+            assert!(definition.description.len() <= 256);
+            assert!(
+                definition
+                    .command
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+            );
+        }
     }
 }

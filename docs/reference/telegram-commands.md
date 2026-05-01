@@ -2,6 +2,8 @@
 
 Commands are group-scoped. A command addressed to another bot, such as `/status@other_bot`, is ignored.
 
+On startup, `telellm` registers this command list with Telegram so clients can show the bot command menu. Telegram clients may cache command menus briefly; restart the client or reopen the chat if a newly registered command is not visible immediately.
+
 ## Addressing
 
 `telellm` handles:
