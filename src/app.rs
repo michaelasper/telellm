@@ -54,6 +54,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         bot.clone(),
         config.limits.telegram_chunk_chars,
     ));
+    let allowed_chat_ids = config.telegram.allowed_chat_ids.clone();
     let router = Arc::new(crate::router::Router::new(
         config.limits.per_group_queue_depth,
         telegram_sink,
@@ -70,6 +71,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     ));
     let app_core = Arc::new(AppCore::new(
         config.telegram.bot_username.clone(),
+        allowed_chat_ids,
         memory_store,
         RollingBuffer::new(config.limits.recent_buffer_messages),
         router,
@@ -88,6 +90,7 @@ where
     N: RuntimeControl + 'static,
 {
     bot_username: String,
+    allowed_chat_ids: Vec<crate::ids::ChatId>,
     memory_store: Arc<M>,
     rolling: Arc<Mutex<RollingBuffer>>,
     router: Arc<Router<S, T>>,
@@ -103,6 +106,7 @@ where
 {
     pub fn new(
         bot_username: String,
+        allowed_chat_ids: Vec<crate::ids::ChatId>,
         memory_store: Arc<M>,
         rolling: RollingBuffer,
         router: Arc<Router<S, T>>,
@@ -110,6 +114,7 @@ where
     ) -> Self {
         Self {
             bot_username,
+            allowed_chat_ids,
             memory_store,
             rolling: Arc::new(Mutex::new(rolling)),
             router,
@@ -120,6 +125,10 @@ where
     pub async fn handle_message(&self, message: IncomingMessage) -> Result<(), AppError> {
         self.rolling.lock().await.push(message.clone());
         let command = BotCommand::parse(&message.text, &self.bot_username)?;
+
+        if !self.chat_allowed(message.chat_id) {
+            return Ok(());
+        }
 
         if command.is_none() && message.addressing(&self.bot_username) == Addressing::Ambient {
             return Ok(());
@@ -205,6 +214,10 @@ where
             },
         }
         Ok(())
+    }
+
+    fn chat_allowed(&self, chat_id: crate::ids::ChatId) -> bool {
+        self.allowed_chat_ids.is_empty() || self.allowed_chat_ids.contains(&chat_id)
     }
 
     async fn reply_text(
@@ -328,6 +341,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_message_should_ignore_disallowed_chat_without_runtime() {
+        let (app, runtime, _messages) = app_with_fakes_and_allowed_chats(vec![ChatId(999)]).await;
+
+        app.handle_message(incoming("@telellm_bot hello"))
+            .await
+            .expect("disallowed chat should be ignored");
+
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn handle_message_should_enqueue_addressed_context() {
         let (app, runtime, mut messages) = app_with_fakes().await;
 
@@ -406,6 +430,32 @@ mod tests {
         let runtime = Arc::new(FakeRuntime::default());
         let app = AppCore::new(
             "telellm_bot".to_owned(),
+            Vec::new(),
+            memory,
+            RollingBuffer::new(10),
+            router,
+            runtime.clone(),
+        );
+        (app, runtime, messages)
+    }
+
+    async fn app_with_fakes_and_allowed_chats(
+        allowed_chat_ids: Vec<ChatId>,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, messages) = FakeTelegram::new();
+        let router = Arc::new(Router::new(4, telegram));
+        router
+            .register_session(ChatId(1), Arc::new(FakeCodexSession))
+            .await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let app = AppCore::new(
+            "telellm_bot".to_owned(),
+            allowed_chat_ids,
             memory,
             RollingBuffer::new(10),
             router,

@@ -2,6 +2,8 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
 
+use crate::ids::ChatId;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub telegram: TelegramConfig,
@@ -17,6 +19,8 @@ pub struct AppConfig {
 pub struct TelegramConfig {
     pub bot_token_env: String,
     pub bot_username: String,
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<ChatId>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -269,6 +273,21 @@ mod tests {
         let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
 
         assert_eq!(config.telegram.bot_username, "telellm_bot");
+    }
+
+    #[test]
+    fn from_toml_str_should_parse_allowed_chat_ids() {
+        let raw = valid_config().replace(
+            "bot_username = \"telellm_bot\"",
+            "bot_username = \"telellm_bot\"\nallowed_chat_ids = [-10012345, 42]",
+        );
+
+        let config = AppConfig::from_toml_str(&raw).expect("config should parse");
+
+        assert_eq!(
+            config.telegram.allowed_chat_ids,
+            vec![ChatId(-10012345), ChatId(42)]
+        );
     }
 
     #[test]

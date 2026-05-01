@@ -338,6 +338,7 @@ mod tests {
             telegram: TelegramConfig {
                 bot_token_env: "TELEGRAM_BOT_TOKEN".to_owned(),
                 bot_username: "telellm_bot".to_owned(),
+                allowed_chat_ids: Vec::new(),
             },
             storage: StorageConfig {
                 sqlite_path: "data/telellm.sqlite".into(),

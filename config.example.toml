@@ -1,6 +1,7 @@
 [telegram]
 bot_token_env = "TELEGRAM_BOT_TOKEN"
 bot_username = "telellm_bot"
+allowed_chat_ids = []
 
 [storage]
 sqlite_path = "data/telellm.sqlite"
