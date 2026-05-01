@@ -31,6 +31,17 @@ impl NetworkPolicy {
         script.push_str("broker_port=\"${TELELLM_BROKER_PORT:-");
         script.push_str(&self.broker_port.to_string());
         script.push_str("}\"\n");
+        script.push_str("while read -r directive nameserver _; do\n");
+        script.push_str("  case \"$nameserver\" in *:*) continue ;; esac\n");
+        script
+            .push_str("  if [ \"$directive\" = \"nameserver\" ] && [ -n \"$nameserver\" ]; then\n");
+        script.push_str("    iptables -A OUTPUT -d \"$nameserver\" -p udp --dport 53 -j ACCEPT\n");
+        script.push_str("    iptables -A OUTPUT -d \"$nameserver\" -p tcp --dport 53 -j ACCEPT\n");
+        script.push_str("  fi\n");
+        script.push_str("done < /etc/resolv.conf\n");
+        script.push_str("docker_dns_ip=\"${DOCKER_DNS_IP:-127.0.0.11}\"\n");
+        script.push_str("iptables -A OUTPUT -d \"$docker_dns_ip\" -p udp --dport 53 -j ACCEPT\n");
+        script.push_str("iptables -A OUTPUT -d \"$docker_dns_ip\" -p tcp --dport 53 -j ACCEPT\n");
         script.push_str("if [ -n \"$broker_host\" ]; then\n");
         script.push_str(
             "  broker_ip=$(getent hosts \"$broker_host\" | awk '{ print $1 }' | head -n 1)\n",
@@ -75,6 +86,34 @@ mod tests {
         assert!(matches!(
             (broker_rule, private_lan_rule),
             (Some(broker), Some(private_lan)) if broker < private_lan
+        ));
+    }
+
+    #[test]
+    fn enforcement_script_should_allow_docker_dns_before_loopback_reject() {
+        let policy = NetworkPolicy::new("host.docker.internal", 8189);
+
+        let script = policy.enforcement_script();
+        let dns_rule = script.find("-d \"$docker_dns_ip\" -p udp --dport 53 -j ACCEPT");
+        let loopback_rule = script.find("iptables -A OUTPUT -d 127.0.0.0/8 -j REJECT");
+
+        assert!(matches!(
+            (dns_rule, loopback_rule),
+            (Some(dns), Some(loopback)) if dns < loopback
+        ));
+    }
+
+    #[test]
+    fn enforcement_script_should_allow_resolv_conf_dns_before_private_lan_reject() {
+        let policy = NetworkPolicy::new("host.docker.internal", 8189);
+
+        let script = policy.enforcement_script();
+        let dns_rule = script.find("-d \"$nameserver\" -p udp --dport 53 -j ACCEPT");
+        let private_lan_rule = script.find("iptables -A OUTPUT -d 192.168.0.0/16 -j REJECT");
+
+        assert!(matches!(
+            (dns_rule, private_lan_rule),
+            (Some(dns), Some(private_lan)) if dns < private_lan
         ));
     }
 }

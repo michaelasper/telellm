@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+while read -r directive nameserver _; do
+  if [[ "$directive" == "nameserver" && -n "${nameserver:-}" && "$nameserver" != *:* ]]; then
+    iptables -A OUTPUT -d "$nameserver" -p udp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -d "$nameserver" -p tcp --dport 53 -j ACCEPT
+  fi
+done < /etc/resolv.conf
+
+docker_dns_ip="${DOCKER_DNS_IP:-127.0.0.11}"
+iptables -A OUTPUT -d "$docker_dns_ip" -p udp --dport 53 -j ACCEPT
+iptables -A OUTPUT -d "$docker_dns_ip" -p tcp --dport 53 -j ACCEPT
+
 if [[ -n "${TELELLM_BROKER_HOST:-}" ]]; then
   broker_ip="$(getent hosts "$TELELLM_BROKER_HOST" | awk '{ print $1 }' | head -n 1)"
   if [[ -n "$broker_ip" ]]; then

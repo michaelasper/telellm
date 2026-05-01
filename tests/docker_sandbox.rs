@@ -32,10 +32,15 @@ fn sandbox_should_allow_public_internet() {
             "telellm-sandbox:local",
             "sh",
             "-lc",
-            "curl --max-time 10 -fsS https://api.openai.com",
+            "curl --max-time 10 -fsS https://example.com",
         ])
         .output()
         .expect("docker should run");
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "docker stdout:\n{}\ndocker stderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
