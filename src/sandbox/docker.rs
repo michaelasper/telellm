@@ -48,8 +48,16 @@ impl DockerSandboxBackend {
         args
     }
 
+    async fn docker_output(args: &[String]) -> Result<std::process::Output, SandboxError> {
+        Command::new("docker")
+            .args(args)
+            .output()
+            .await
+            .map_err(SandboxError::Io)
+    }
+
     async fn docker(args: &[String]) -> Result<(), SandboxError> {
-        let output = Command::new("docker").args(args).output().await?;
+        let output = Self::docker_output(args).await?;
         if output.status.success() {
             Ok(())
         } else {
@@ -57,6 +65,31 @@ impl DockerSandboxBackend {
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ))
         }
+    }
+
+    async fn container_running(spec: &SandboxSpec) -> Result<Option<bool>, SandboxError> {
+        let output = Self::docker_output(&[
+            "inspect".to_owned(),
+            "--format".to_owned(),
+            "{{.State.Running}}".to_owned(),
+            spec.sandbox_id.to_string(),
+        ])
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("No such object") || stderr.contains("No such container") {
+                return Ok(None);
+            }
+            return Err(SandboxError::Docker(stderr.into_owned()));
+        }
+
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim() == "true",
+        ))
+    }
+
+    async fn start_existing(spec: &SandboxSpec) -> Result<(), SandboxError> {
+        Self::docker(&["start".to_owned(), spec.sandbox_id.to_string()]).await
     }
 
     async fn docker_ignore_missing(
@@ -74,7 +107,11 @@ impl DockerSandboxBackend {
 #[async_trait]
 impl SandboxBackend for DockerSandboxBackend {
     async fn ensure_started(&self, spec: &SandboxSpec) -> Result<(), SandboxError> {
-        Self::docker(&Self::run_args(spec)).await
+        match Self::container_running(spec).await? {
+            Some(true) => Ok(()),
+            Some(false) => Self::start_existing(spec).await,
+            None => Self::docker(&Self::run_args(spec)).await,
+        }
     }
 
     async fn restart(&self, spec: &SandboxSpec) -> Result<(), SandboxError> {

@@ -6,4 +6,5 @@ pub mod config;
 pub mod ids;
 pub mod memory;
 pub mod router;
+pub mod runtime;
 pub mod sandbox;
