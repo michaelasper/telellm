@@ -181,14 +181,7 @@ impl DockerSandboxBackend {
             destination.display().to_string(),
         ])
         .await?;
-        let metadata = std::fs::metadata(destination)?;
-        if !metadata.is_file() {
-            return Err(SandboxError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("exported workspace path is not a file: {workspace_path}"),
-            )));
-        }
-        Ok(metadata.len())
+        validate_exported_workspace_file(destination, workspace_path, max_bytes)
     }
 
     async fn workspace_file_size(
@@ -327,6 +320,32 @@ impl DockerSandboxBackend {
 
 fn docker_error_mentions_missing_object(message: &str, missing_marker: &str) -> bool {
     message.contains(missing_marker) || message.to_ascii_lowercase().contains("no such object")
+}
+
+fn validate_exported_workspace_file(
+    destination: &Path,
+    workspace_path: &str,
+    max_bytes: u64,
+) -> Result<u64, SandboxError> {
+    let metadata = std::fs::metadata(destination)?;
+    if !metadata.is_file() {
+        return Err(SandboxError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("exported workspace path is not a file: {workspace_path}"),
+        )));
+    }
+
+    let exported_bytes = metadata.len();
+    if exported_bytes > max_bytes {
+        let _ = std::fs::remove_file(destination);
+        return Err(SandboxError::WorkspaceFileTooLarge {
+            path: workspace_path.to_owned(),
+            bytes: exported_bytes,
+            max_bytes,
+        });
+    }
+
+    Ok(exported_bytes)
 }
 
 #[async_trait]
@@ -583,6 +602,30 @@ mod tests {
             .expect_err("workspace path should be invalid");
 
         assert!(matches!(err, SandboxError::InvalidWorkspacePath { .. }));
+    }
+
+    #[test]
+    fn validate_exported_workspace_file_should_accept_file_within_limit() {
+        let path = unique_temp_path("exported-file");
+        std::fs::write(&path, b"ok").expect("export fixture should be written");
+
+        let bytes = validate_exported_workspace_file(&path, "telegram_outputs/a.txt", 2)
+            .expect("exported file should be valid");
+
+        std::fs::remove_file(&path).expect("export fixture should be removed");
+        assert_eq!(bytes, 2);
+    }
+
+    #[test]
+    fn validate_exported_workspace_file_should_remove_file_over_limit() {
+        let path = unique_temp_path("oversized-exported-file");
+        std::fs::write(&path, b"too large").expect("export fixture should be written");
+
+        let err = validate_exported_workspace_file(&path, "telegram_outputs/a.txt", 3)
+            .expect_err("oversized export should be rejected");
+
+        assert!(matches!(err, SandboxError::WorkspaceFileTooLarge { .. }));
+        assert!(!path.exists());
     }
 
     fn unique_temp_path(label: &str) -> std::path::PathBuf {

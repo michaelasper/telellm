@@ -114,6 +114,8 @@ pub enum TelegramError {
     Send(String),
     #[error("telegram edit failed: {0}")]
     Edit(String),
+    #[error("telegram edit skipped because message is not modified")]
+    MessageNotModified,
     #[error("telegram chat action failed: {0}")]
     ChatAction(String),
     #[error("telegram file download failed: {0}")]
@@ -224,6 +226,7 @@ impl TeloxideTelegramSink {
             .await
         {
             Ok(message) => Ok(message),
+            Err(TelegramError::MessageNotModified) => Err(TelegramError::MessageNotModified),
             Err(_)
                 if options.formatting_fallback_to_plain
                     && options.formatting_mode != TelegramFormatMode::Plain =>
@@ -305,19 +308,22 @@ impl TelegramSink for TeloxideTelegramSink {
             return Ok(());
         };
 
-        if let Err(err) = self
+        match self
             .edit_chunk_with_fallback(chat_id, message_id, first, options)
             .await
         {
-            tracing::warn!(
-                error = %err,
-                chat_id = ?chat_id,
-                message_id = ?message_id,
-                "failed to edit streamed Telegram message with final Codex response; sending a new message"
-            );
-            self.send_message_with_options(chat_id, text, options)
-                .await?;
-            return Ok(());
+            Ok(_) | Err(TelegramError::MessageNotModified) => {}
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    chat_id = ?chat_id,
+                    message_id = ?message_id,
+                    "failed to edit streamed Telegram message with final Codex response; sending a new message"
+                );
+                self.send_message_with_options(chat_id, text, options)
+                    .await?;
+                return Ok(());
+            }
         }
 
         for chunk in rest {
@@ -393,6 +399,12 @@ fn telegram_send_error(err: teloxide::RequestError) -> TelegramError {
 }
 
 fn telegram_edit_error(err: teloxide::RequestError) -> TelegramError {
+    if matches!(
+        err,
+        teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)
+    ) {
+        return TelegramError::MessageNotModified;
+    }
     TelegramError::Edit(err.to_string())
 }
 
@@ -626,6 +638,16 @@ mod tests {
             parse_retry_after_duration(error),
             Some(Duration::from_secs(7))
         );
+    }
+
+    #[test]
+    fn telegram_edit_error_should_classify_unchanged_message() {
+        let err = teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified);
+
+        assert!(matches!(
+            telegram_edit_error(err),
+            TelegramError::MessageNotModified
+        ));
     }
 
     #[test]

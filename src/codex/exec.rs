@@ -1,4 +1,6 @@
-use super::session::{CodexRequest, CodexSession, CodexSessionError, CodexTurn};
+use super::session::{
+    CodexEventSender, CodexRequest, CodexSession, CodexSessionError, CodexTurn, CodexTurnEvent,
+};
 use async_trait::async_trait;
 use std::{process::Stdio, time::Duration};
 use tokio::{
@@ -33,6 +35,14 @@ impl CommandCodexSession {
 #[async_trait]
 impl CodexSession for CommandCodexSession {
     async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
+        self.send_with_events(request, None).await
+    }
+
+    async fn send_with_events(
+        &self,
+        request: CodexRequest,
+        events: Option<CodexEventSender>,
+    ) -> Result<CodexTurn, CodexSessionError> {
         let mut child = Command::new(&self.command)
             .args(&self.args)
             .stdin(Stdio::piped())
@@ -67,7 +77,11 @@ impl CodexSession for CommandCodexSession {
             CodexSessionError::Process("Codex command stderr was unavailable".to_owned())
         })?;
         let max_output_bytes = self.max_output_bytes;
-        let stdout_task = tokio::spawn(read_limited(stdout, max_output_bytes));
+        let stdout_task = tokio::spawn(read_limited_with_events(
+            stdout,
+            max_output_bytes,
+            events.clone(),
+        ));
         let stderr_task = tokio::spawn(read_limited(stderr, max_output_bytes));
 
         let status = match tokio::time::timeout(self.timeout, child.wait()).await {
@@ -91,6 +105,7 @@ impl CodexSession for CommandCodexSession {
         let stdout = join_reader(stdout_task).await?;
         let stderr = join_reader(stderr_task).await?;
         let stderr_text = String::from_utf8_lossy(&stderr);
+        let output = String::from_utf8_lossy(&stdout).trim().to_owned();
 
         if !status.success() {
             return Err(CodexSessionError::Process(format!(
@@ -99,9 +114,8 @@ impl CodexSession for CommandCodexSession {
             )));
         }
 
-        Ok(CodexTurn::text(
-            String::from_utf8_lossy(&stdout).trim().to_owned(),
-        ))
+        emit_command_snapshot(output.as_bytes(), events.as_ref(), true);
+        Ok(CodexTurn::text(output))
     }
 
     async fn restart(&self) -> Result<(), CodexSessionError> {
@@ -109,12 +123,20 @@ impl CodexSession for CommandCodexSession {
     }
 }
 
-async fn read_limited<R>(
+async fn read_limited<R>(reader: R, max_output_bytes: usize) -> Result<Vec<u8>, CodexSessionError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    read_limited_with_events(reader, max_output_bytes, None).await
+}
+
+async fn read_limited_with_events<R>(
     mut reader: R,
     max_output_bytes: usize,
+    events: Option<CodexEventSender>,
 ) -> Result<Vec<u8>, CodexSessionError>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
 {
     let mut output = Vec::new();
     let mut buffer = [0_u8; 8192];
@@ -131,6 +153,20 @@ where
                 "Codex command exceeded {max_output_bytes} bytes of output"
             )));
         }
+        emit_command_snapshot(&output, events.as_ref(), false);
+    }
+}
+
+fn emit_command_snapshot(output: &[u8], events: Option<&CodexEventSender>, is_final: bool) {
+    let Some(events) = events else {
+        return;
+    };
+    let output = String::from_utf8_lossy(output).trim().to_owned();
+    if output.is_empty() {
+        return;
+    }
+    if let Err(err) = events.try_send(CodexTurnEvent::OutputSnapshot { output, is_final }) {
+        tracing::debug!(error = %err, "dropped Codex command snapshot");
     }
 }
 
@@ -165,6 +201,48 @@ mod tests {
             .expect("command should succeed");
 
         assert_eq!(turn.output, "answer:hello");
+    }
+
+    #[tokio::test]
+    async fn command_session_should_emit_streaming_snapshots_from_stdout() {
+        let session = CommandCodexSession::new(
+            "sh",
+            vec![
+                "-lc".to_owned(),
+                "IFS= read -r line; printf 'first:%s\\n' \"$line\"; sleep 0.1; printf 'second\\n'"
+                    .to_owned(),
+            ],
+            Duration::from_secs(2),
+            1024,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let session_task = tokio::spawn(async move {
+            session
+                .send_with_events(
+                    CodexRequest {
+                        prompt: "hello".to_owned(),
+                    },
+                    Some(tx),
+                )
+                .await
+        });
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("streaming event should arrive before command exits")
+            .expect("event sender should stay open");
+        assert!(matches!(
+            event,
+            CodexTurnEvent::OutputSnapshot { output, is_final: false }
+                if output == "first:hello"
+        ));
+
+        let turn = session_task
+            .await
+            .expect("session task should not panic")
+            .expect("command should succeed");
+        assert_eq!(turn.output, "first:hello\nsecond");
     }
 
     #[tokio::test]

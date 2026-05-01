@@ -336,11 +336,16 @@ where
                 event = event_rx.recv(), if !events_closed => {
                     match event {
                         Some(CodexTurnEvent::OutputSnapshot { output, is_final }) => {
-                            if !is_final
-                                && !Self::worker_is_stale(&sessions, chat_id, generation).await
-                            {
-                                stream.update(&telegram, chat_id, &output).await;
-                            }
+                            Self::handle_streaming_event(
+                                &mut stream,
+                                &telegram,
+                                &sessions,
+                                chat_id,
+                                generation,
+                                &output,
+                                is_final,
+                            )
+                            .await;
                         }
                         None => {
                             events_closed = true;
@@ -352,10 +357,42 @@ where
                         Ok(result) => result,
                         Err(err) => Err(CodexSessionError::Process(err.to_string())),
                     };
+                    while let Ok(CodexTurnEvent::OutputSnapshot { output, is_final }) =
+                        event_rx.try_recv()
+                    {
+                        Self::handle_streaming_event(
+                            &mut stream,
+                            &telegram,
+                            &sessions,
+                            chat_id,
+                            generation,
+                            &output,
+                            is_final,
+                        )
+                        .await;
+                    }
                     return (result, stream.message_id());
                 }
             }
         }
+    }
+
+    async fn handle_streaming_event(
+        stream: &mut StreamingState,
+        telegram: &Arc<T>,
+        sessions: &Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
+        chat_id: ChatId,
+        generation: u64,
+        output: &str,
+        is_final: bool,
+    ) {
+        if is_final && stream.message_id().is_some() {
+            return;
+        }
+        if Self::worker_is_stale(sessions, chat_id, generation).await {
+            return;
+        }
+        stream.update(telegram, chat_id, output).await;
     }
 
     fn spawn_typing_loop(telegram: Arc<T>, chat_id: ChatId, refresh: Duration) -> TypingHandle {
@@ -627,6 +664,8 @@ mod tests {
         }
     }
 
+    struct CompletionSnapshotSession;
+
     #[async_trait]
     impl CodexSession for StreamingSession {
         async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
@@ -648,6 +687,32 @@ mod tests {
             self.release.notified().await;
 
             Ok(CodexTurn::text("final answer from codex"))
+        }
+
+        async fn restart(&self) -> Result<(), CodexSessionError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl CodexSession for CompletionSnapshotSession {
+        async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
+            self.send_with_events(request, None).await
+        }
+
+        async fn send_with_events(
+            &self,
+            request: CodexRequest,
+            events: Option<CodexEventSender>,
+        ) -> Result<CodexTurn, CodexSessionError> {
+            let output = format!("snapshot: {}", request.prompt);
+            if let Some(events) = events {
+                let _ = events.try_send(CodexTurnEvent::OutputSnapshot {
+                    output: output.clone(),
+                    is_final: false,
+                });
+            }
+            Ok(CodexTurn::text(output))
         }
 
         async fn restart(&self) -> Result<(), CodexSessionError> {
@@ -1025,6 +1090,71 @@ mod tests {
         assert_eq!(
             receive_message(&mut messages).await,
             "edit:1:final answer from codex"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_should_stream_final_only_default_snapshot_then_edit_final_message() {
+        let (telegram, mut messages) = fake_telegram();
+        let session = Arc::new(FakeSession::default());
+        let router = Router::new_with_telegram_ux(
+            4,
+            telegram,
+            TelegramUxConfig {
+                typing_indicator_enabled: false,
+                streaming_min_delta_chars: 1,
+                streaming_update_interval_millis: 1,
+                ..TelegramUxConfig::default()
+            },
+        );
+        router.register_session(ChatId(1), 1, session).await;
+
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "exec-style".to_owned(),
+            })
+            .await
+            .expect("enqueue should work");
+
+        assert_eq!(receive_message(&mut messages).await, "reply: exec-style");
+        assert_eq!(
+            receive_message(&mut messages).await,
+            "edit:1:reply: exec-style"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_should_drain_snapshot_queued_at_session_completion() {
+        let (telegram, mut messages) = fake_telegram();
+        let session = Arc::new(CompletionSnapshotSession);
+        let router = Router::new_with_telegram_ux(
+            4,
+            telegram,
+            TelegramUxConfig {
+                typing_indicator_enabled: false,
+                streaming_min_delta_chars: 1,
+                streaming_update_interval_millis: 1,
+                ..TelegramUxConfig::default()
+            },
+        );
+        router.register_session(ChatId(1), 1, session).await;
+
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "complete-now".to_owned(),
+            })
+            .await
+            .expect("enqueue should work");
+
+        assert_eq!(
+            receive_message(&mut messages).await,
+            "snapshot: complete-now"
+        );
+        assert_eq!(
+            receive_message(&mut messages).await,
+            "edit:1:snapshot: complete-now"
         );
     }
 
