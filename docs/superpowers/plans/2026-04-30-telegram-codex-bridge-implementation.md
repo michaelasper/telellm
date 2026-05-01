@@ -3450,7 +3450,7 @@ The first implementation pass now compiles, passes tests, and has the major revi
 - Modify: `README.md`
 - Test: `src/doctor.rs`
 
-- [ ] **Step 1: Add `doctor` module export**
+- [x] **Step 1: Add `doctor` module export**
 
 Edit `src/lib.rs`:
 
@@ -3468,7 +3468,7 @@ pub mod runtime;
 pub mod sandbox;
 ```
 
-- [ ] **Step 2: Add CLI subcommands**
+- [x] **Step 2: Add CLI subcommands**
 
 Replace the current `Cli` shape in `src/main.rs` with a `Run` and `Doctor` subcommand:
 
@@ -3498,7 +3498,7 @@ enum Command {
 
 In `main`, treat no subcommand as `Run` for backwards compatibility.
 
-- [ ] **Step 3: Implement doctor checks**
+- [x] **Step 3: Implement doctor checks**
 
 Create `src/doctor.rs` with checks for:
 
@@ -3513,7 +3513,7 @@ Create `src/doctor.rs` with checks for:
 
 Return a typed `DoctorReport` with `checks: Vec<DoctorCheck>`, where each check has `name`, `status`, and `detail`.
 
-- [ ] **Step 4: Add failing tests**
+- [x] **Step 4: Add failing tests**
 
 Add tests in `src/doctor.rs` for pure command construction:
 
@@ -3536,7 +3536,7 @@ fn codex_version_probe_args_should_use_configured_image_and_network() {
 }
 ```
 
-- [ ] **Step 5: Update README setup**
+- [x] **Step 5: Update README setup**
 
 Add setup commands:
 
@@ -3549,7 +3549,7 @@ cargo run -- doctor --config config.toml --create-network
 
 Explain that `telellm_public` must exist before the daemon starts because `config.example.toml` references it.
 
-- [ ] **Step 6: Run validation**
+- [x] **Step 6: Run validation**
 
 Run:
 
@@ -3561,7 +3561,7 @@ cargo run -- doctor --config config.example.toml
 
 Expected: doctor unit tests pass; doctor reports missing env vars for example config instead of panicking; full checks pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 Run:
 
@@ -3582,7 +3582,7 @@ git commit -m "feat: add setup doctor"
 - Test: `src/config.rs`
 - Test: `src/app.rs`
 
-- [ ] **Step 1: Add allowed chat IDs to config**
+- [x] **Step 1: Add allowed chat IDs to config**
 
 Extend `TelegramConfig`:
 
@@ -3598,11 +3598,11 @@ pub struct TelegramConfig {
 
 If `ChatId` does not implement `Deserialize`, derive it in `src/ids.rs`.
 
-- [ ] **Step 2: Reject disallowed chats before runtime startup**
+- [x] **Step 2: Reject disallowed chats before runtime startup**
 
 In `AppCore::handle_message`, after pushing to the rolling buffer and parsing the command, return early when the allowlist is non-empty and `message.chat_id` is not allowed. The early return must happen before `self.runtime.ensure_chat_runtime(...)`.
 
-- [ ] **Step 3: Add tests**
+- [x] **Step 3: Add tests**
 
 Add config test:
 
@@ -3635,7 +3635,7 @@ async fn handle_message_should_ignore_disallowed_chat_without_runtime() {
 }
 ```
 
-- [ ] **Step 4: Update example config and README**
+- [x] **Step 4: Update example config and README**
 
 Add to `config.example.toml`:
 
@@ -3651,7 +3651,7 @@ Document:
 - Set `allowed_chat_ids` before exposing the bot broadly.
 - Use Telegram `getUpdates` or bot logs to discover a group chat ID.
 
-- [ ] **Step 5: Run validation**
+- [x] **Step 5: Run validation**
 
 Run:
 
@@ -3663,7 +3663,7 @@ cargo test app::tests::handle_message_should_ignore_disallowed_chat_without_runt
 
 Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -3681,7 +3681,7 @@ git commit -m "feat: add Telegram chat allowlist"
 - Modify: `src/bot/telegram.rs` only if the sink boundary needs a helper
 - Test: `src/app.rs`
 
-- [ ] **Step 1: Split command handling by local vs Codex-backed commands**
+- [x] **Step 1: Split command handling by local vs Codex-backed commands**
 
 Change `/help`, `/status`, `/memory`, `/forget`, and confirmation messages to use `TelegramSink::send_message` directly instead of `router.enqueue(...)`.
 
@@ -3692,7 +3692,7 @@ Keep runtime startup only for commands that require a running sandbox/Codex sess
 - `/restart`;
 - `/rebuild`;
 
-- [ ] **Step 2: Add direct reply helper**
+- [x] **Step 2: Add direct reply helper**
 
 Add this helper to `AppCore`:
 
@@ -3715,7 +3715,7 @@ pub fn telegram(&self) -> Arc<T> {
 }
 ```
 
-- [ ] **Step 3: Add tests**
+- [x] **Step 3: Add tests**
 
 Add:
 
@@ -3741,7 +3741,7 @@ async fn forget_all_should_not_start_codex() {
 }
 ```
 
-- [ ] **Step 4: Surface runtime failures to chat**
+- [x] **Step 4: Surface runtime failures to chat**
 
 In `IncomingMessageHandler for AppCore`, send a safe error message on `Runtime` and `Router` errors:
 
@@ -3751,7 +3751,7 @@ let text = format!("I could not start this group's Codex runtime: {err}");
 
 Do not include tokens, config values, raw env vars, or full command lines.
 
-- [ ] **Step 5: Add runtime failure test**
+- [x] **Step 5: Add runtime failure test**
 
 Add:
 
@@ -3766,7 +3766,7 @@ async fn runtime_start_failure_should_send_telegram_error() {
 }
 ```
 
-- [ ] **Step 6: Run validation**
+- [x] **Step 6: Run validation**
 
 Run:
 
@@ -3779,7 +3779,7 @@ cargo test app::tests::runtime_start_failure_should_send_telegram_error
 
 Expected: all pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 Run:
 
@@ -3800,7 +3800,7 @@ git commit -m "feat: handle control commands locally"
 - Test: `src/router.rs`
 - Test: `src/app.rs`
 
-- [ ] **Step 1: Define runtime status**
+- [x] **Step 1: Define runtime status**
 
 Add:
 
@@ -3823,15 +3823,15 @@ pub enum RuntimeState {
 
 Add `async fn chat_status(&self, chat_id: ChatId) -> ChatRuntimeStatus` to `RuntimeControl`.
 
-- [ ] **Step 2: Serialize all lifecycle operations**
+- [x] **Step 2: Serialize all lifecycle operations**
 
 Reuse the per-chat lifecycle lock for `ensure`, `reset`, `restart`, and `rebuild`, not only cold starts. Increment the generation every time a session is replaced.
 
-- [ ] **Step 3: Make router workers generation-aware**
+- [x] **Step 3: Make router workers generation-aware**
 
 Store the generation with registered sessions. When a new session is registered, old workers must stop processing stale queued work or mark it stale instead of sending responses from the old session after a reset.
 
-- [ ] **Step 4: Add tests**
+- [x] **Step 4: Add tests**
 
 Add these tests with the named behavior:
 
@@ -3839,7 +3839,7 @@ Add these tests with the named behavior:
 - `router::tests::register_session_should_not_send_stale_generation_after_replacement`: enqueue slow work against generation 1, register generation 2 before the slow work returns, then assert Telegram receives only generation 2 output.
 - `app::tests::status_should_report_degraded_runtime_without_codex_prompt`: configure fake runtime status as `Degraded("docker unavailable")`, send `/status`, assert the Telegram reply includes `degraded` and fake Codex session receives no prompt.
 
-- [ ] **Step 5: Run validation**
+- [x] **Step 5: Run validation**
 
 Run:
 
@@ -3852,7 +3852,7 @@ cargo test app::tests::status_should_report_degraded_runtime_without_codex_promp
 
 Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -3875,7 +3875,7 @@ git commit -m "feat: track chat runtime status"
 - Test: `src/runtime.rs`
 - Test: `tests/codex_sandbox_smoke.rs`
 
-- [ ] **Step 1: Add explicit PTY limits to config**
+- [x] **Step 1: Add explicit PTY limits to config**
 
 Extend `LimitsConfig`:
 
@@ -3890,7 +3890,7 @@ pub codex_max_output_bytes: usize,
 
 Validate all are greater than zero.
 
-- [ ] **Step 2: Construct `PtyReadPolicy` from config**
+- [x] **Step 2: Construct `PtyReadPolicy` from config**
 
 Add:
 
@@ -3907,7 +3907,7 @@ pub fn codex_read_policy(config: &AppConfig) -> crate::codex::pty::PtyReadPolicy
 
 Use `PtyCodexSession::spawn_with_read_policy` in `RuntimeManager`.
 
-- [ ] **Step 3: Add tests**
+- [x] **Step 3: Add tests**
 
 Add these tests with the named behavior:
 
@@ -3915,7 +3915,7 @@ Add these tests with the named behavior:
 - `config::tests::codex_read_policy_should_use_configured_limits`: add explicit limit values to the valid test config and assert `first_byte_timeout`, `inactivity_timeout`, `max_turn_timeout`, and `max_output_bytes`.
 - `runtime::tests::codex_session_should_use_configured_inactivity_timeout`: construct a runtime manager with test config limits and assert the policy passed to PTY construction matches those values through a test-only policy builder.
 
-- [ ] **Step 4: Add ignored live Codex sandbox smoke test**
+- [x] **Step 4: Add ignored live Codex sandbox smoke test**
 
 Create `tests/codex_sandbox_smoke.rs`:
 
@@ -3945,7 +3945,7 @@ fn codex_sandbox_should_report_version() {
 }
 ```
 
-- [ ] **Step 5: Run validation**
+- [x] **Step 5: Run validation**
 
 Run:
 
@@ -3957,7 +3957,7 @@ cargo test --test codex_sandbox_smoke -- --ignored
 
 Expected: focused tests and full checks pass; smoke test passes when Docker image is available.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -3978,7 +3978,7 @@ git commit -m "feat: configure Codex PTY limits"
 - Test: `src/broker.rs`
 - Test: `src/runtime.rs`
 
-- [ ] **Step 1: Replace static token with generated per-chat token**
+- [x] **Step 1: Replace static token with generated per-chat token**
 
 Introduce a `BrokerToken` type:
 
@@ -3993,7 +3993,7 @@ Generate one token per chat runtime using a cryptographically random source. If 
 cargo add rand
 ```
 
-- [ ] **Step 2: Register active tokens in broker state**
+- [x] **Step 2: Register active tokens in broker state**
 
 `BrokerState` should track active tokens and owning chat IDs:
 
@@ -4008,11 +4008,11 @@ The broker must reject:
 - stale tokens after rotation;
 - tokens that exceed configured rate/concurrency limits.
 
-- [ ] **Step 3: Rotate tokens on reset and rebuild**
+- [x] **Step 3: Rotate tokens on reset and rebuild**
 
 When a runtime is rebuilt or reset with workspace clear, generate a fresh token, update the sandbox spec, and invalidate the old token in broker state.
 
-- [ ] **Step 4: Add tests**
+- [x] **Step 4: Add tests**
 
 Add these tests with the named behavior:
 
@@ -4021,7 +4021,7 @@ Add these tests with the named behavior:
 - `broker::tests::router_should_rate_limit_sandbox_requests`: configure a one-request window, send two valid requests, assert the second response is `429 Too Many Requests`.
 - `runtime::tests::spec_for_chat_should_use_unique_broker_token`: build specs for two chat IDs and assert their `broker_token` values differ and are non-empty.
 
-- [ ] **Step 5: Run validation**
+- [x] **Step 5: Run validation**
 
 Run:
 
@@ -4034,7 +4034,7 @@ cargo test runtime::tests::spec_for_chat_should_use_unique_broker_token
 
 Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -4054,7 +4054,7 @@ git commit -m "feat: scope broker tokens per chat"
 - Test: `src/bot/command.rs`
 - Test: `src/app.rs`
 
-- [ ] **Step 1: Add `/remember` command**
+- [x] **Step 1: Add `/remember` command**
 
 Extend `BotCommand`:
 
@@ -4064,7 +4064,7 @@ Remember { content: String },
 
 Parse `/remember <fact>` and reject empty input with `CommandParseError::MissingArgument("/remember")`.
 
-- [ ] **Step 2: Write memory directly on the host**
+- [x] **Step 2: Write memory directly on the host**
 
 Handle `/remember` in `AppCore::handle_command` by calling:
 
@@ -4076,7 +4076,7 @@ self.memory_store
 
 Reply directly to Telegram with `Remembered that for this group.` Do not start Codex for `/remember`.
 
-- [ ] **Step 3: Add tests**
+- [x] **Step 3: Add tests**
 
 Add:
 
@@ -4107,7 +4107,7 @@ async fn remember_should_write_memory_without_runtime() {
 }
 ```
 
-- [ ] **Step 4: Update README**
+- [x] **Step 4: Update README**
 
 Document:
 
@@ -4115,7 +4115,7 @@ Document:
 /remember <fact> stores a host-managed group memory record. The sandbox can see remembered facts as prompt context, but cannot directly edit the host memory database.
 ```
 
-- [ ] **Step 5: Run validation**
+- [x] **Step 5: Run validation**
 
 Run:
 
@@ -4127,7 +4127,7 @@ cargo test app::tests::remember_should_write_memory_without_runtime
 
 Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -4148,7 +4148,7 @@ git commit -m "feat: add group remember command"
 - Test: `src/app.rs`
 - Test: `src/bot/telegram.rs`
 
-- [ ] **Step 1: Return queue position from router enqueue**
+- [x] **Step 1: Return queue position from router enqueue**
 
 Change `Router::enqueue` to return:
 
@@ -4161,7 +4161,7 @@ pub struct EnqueueReceipt {
 
 Use `mpsc::Sender::capacity()` and configured queue depth to estimate position before enqueueing.
 
-- [ ] **Step 2: Send busy acknowledgement for queued work**
+- [x] **Step 2: Send busy acknowledgement for queued work**
 
 When `queue_position > 0`, `AppCore` should send a short direct Telegram acknowledgement such as:
 
@@ -4169,11 +4169,11 @@ When `queue_position > 0`, `AppCore` should send a short direct Telegram acknowl
 Queued behind 2 existing request(s).
 ```
 
-- [ ] **Step 3: Add Telegram retry-after handling**
+- [x] **Step 3: Add Telegram retry-after handling**
 
 In `TeloxideTelegramSink`, detect Telegram retry-after/rate-limit errors when teloxide exposes them. Sleep for the requested duration plus a small buffer, then retry once. If teloxide does not expose structured retry-after for the current error type, add a narrow helper that can be unit tested with a synthetic error string and document the limitation.
 
-- [ ] **Step 4: Add tests**
+- [x] **Step 4: Add tests**
 
 Add these tests with the named behavior:
 
@@ -4181,7 +4181,7 @@ Add these tests with the named behavior:
 - `app::tests::addressed_message_should_acknowledge_long_running_turn`: send two addressed messages while the first fake Codex turn is blocked, assert Telegram receives a queued acknowledgement for the second message.
 - `bot::telegram::tests::retry_after_parser_should_extract_seconds`: pass a synthetic Telegram error string containing `retry after 7`, assert the helper returns `Some(Duration::from_secs(7))`.
 
-- [ ] **Step 5: Run validation**
+- [x] **Step 5: Run validation**
 
 Run:
 
@@ -4194,7 +4194,7 @@ cargo test bot::telegram::tests::retry_after_parser_should_extract_seconds
 
 Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
