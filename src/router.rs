@@ -107,6 +107,11 @@ where
         self.senders.lock().await.remove(&chat_id);
     }
 
+    pub async fn mark_session_stale(&self, chat_id: ChatId) {
+        self.sessions.lock().await.remove(&chat_id);
+        self.senders.lock().await.remove(&chat_id);
+    }
+
     pub async fn enqueue(&self, item: GroupWorkItem) -> Result<EnqueueReceipt, RouterError> {
         let chat_id = item.chat_id;
         let sender = self.sender_for_chat(item.chat_id).await?;
@@ -503,6 +508,35 @@ mod tests {
                 .await
                 .is_err(),
             "stale generation should not publish a Telegram response"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_session_stale_should_suppress_in_flight_response_before_replacement() {
+        let (telegram, mut messages) = fake_telegram();
+        let first_session = Arc::new(SlowSession::new("first"));
+        let router = Router::new(4, telegram);
+        router
+            .register_session(ChatId(1), 1, first_session.clone())
+            .await;
+
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "stale".to_owned(),
+            })
+            .await
+            .expect("first enqueue should work");
+        first_session.entered.notified().await;
+
+        router.mark_session_stale(ChatId(1)).await;
+        first_session.release.notify_one();
+
+        assert!(
+            timeout(Duration::from_millis(50), messages.recv())
+                .await
+                .is_err(),
+            "stale session should not publish after lifecycle replacement starts"
         );
     }
 

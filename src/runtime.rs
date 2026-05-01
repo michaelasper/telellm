@@ -79,6 +79,12 @@ where
     statuses: Mutex<HashMap<ChatId, RuntimeStatusRecord>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerTokenState {
+    Existing,
+    Generated,
+}
+
 impl<T> RuntimeManager<T>
 where
     T: TelegramSink + 'static,
@@ -132,6 +138,14 @@ where
     }
 
     fn spec_for_chat(&self, chat_id: ChatId) -> Result<SandboxSpec, RuntimeError> {
+        self.spec_for_chat_with_token_state(chat_id)
+            .map(|(spec, _token_state)| spec)
+    }
+
+    fn spec_for_chat_with_token_state(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<(SandboxSpec, BrokerTokenState), RuntimeError> {
         let broker_url =
             reqwest::Url::parse(&self.broker_config.public_base_url).map_err(|_| {
                 RuntimeError::InvalidBrokerUrl(self.broker_config.public_base_url.clone())
@@ -155,19 +169,23 @@ where
         spec.broker_host = broker_host;
         spec.broker_port = broker_port;
         spec.broker_base_url = self.broker_config.public_base_url.clone();
-        spec.broker_token = self.broker_token_for_chat(chat_id);
-        Ok(spec)
+        let (broker_token, token_state) = self.broker_token_for_chat(chat_id);
+        spec.broker_token = broker_token;
+        Ok((spec, token_state))
     }
 
-    fn broker_token_for_chat(&self, chat_id: ChatId) -> BrokerToken {
+    fn broker_token_for_chat(&self, chat_id: ChatId) -> (BrokerToken, BrokerTokenState) {
         let mut broker_tokens = self
             .broker_tokens
             .lock()
             .expect("broker token map mutex should not be poisoned");
-        broker_tokens
-            .entry(chat_id)
-            .or_insert_with(BrokerToken::generate)
-            .clone()
+        if let Some(token) = broker_tokens.get(&chat_id) {
+            return (token.clone(), BrokerTokenState::Existing);
+        }
+
+        let token = BrokerToken::generate();
+        broker_tokens.insert(chat_id, token.clone());
+        (token, BrokerTokenState::Generated)
     }
 
     fn rotate_broker_token_for_chat(&self, chat_id: ChatId) {
@@ -206,10 +224,24 @@ where
         Ok(())
     }
 
+    async fn ensure_sandbox_started_for_token(
+        &self,
+        spec: &SandboxSpec,
+        token_state: BrokerTokenState,
+    ) -> Result<(), RuntimeError> {
+        if should_recreate_sandbox_for_token_state(token_state) {
+            self.docker.rebuild(spec, false).await?;
+        } else {
+            self.docker.ensure_started(spec).await?;
+        }
+        Ok(())
+    }
+
     async fn ensure_chat_runtime_inner(&self, chat_id: ChatId) -> Result<(), RuntimeError> {
         self.ensure_unregistered_chat_runtime(chat_id, async {
-            let spec = self.spec_for_chat(chat_id)?;
-            self.docker.ensure_started(&spec).await?;
+            let (spec, token_state) = self.spec_for_chat_with_token_state(chat_id)?;
+            self.ensure_sandbox_started_for_token(&spec, token_state)
+                .await?;
             self.spawn_and_register_session(&spec).await
         })
         .await
@@ -242,6 +274,7 @@ where
         self.with_chat_lifecycle_lock(chat_id, async move {
             self.set_runtime_state(chat_id, RuntimeState::Starting)
                 .await;
+            self.router.mark_session_stale(chat_id).await;
             self.registered.lock().await.remove(&chat_id);
             let result = replace_session.await;
             self.record_lifecycle_result(chat_id, &result).await;
@@ -343,11 +376,12 @@ where
                 self.rotate_broker_token_for_chat(chat_id);
                 self.broker_registry.unregister_chat(chat_id).await;
             }
-            let spec = self.spec_for_chat(chat_id)?;
+            let (spec, token_state) = self.spec_for_chat_with_token_state(chat_id)?;
             if clear_workspace {
                 self.docker.rebuild(&spec, true).await?;
             } else {
-                self.docker.ensure_started(&spec).await?;
+                self.ensure_sandbox_started_for_token(&spec, token_state)
+                    .await?;
             }
             self.spawn_and_register_session(&spec).await
         })
@@ -356,8 +390,12 @@ where
 
     async fn restart_chat_runtime_inner(&self, chat_id: ChatId) -> Result<(), RuntimeError> {
         self.replace_chat_session(chat_id, async move {
-            let spec = self.spec_for_chat(chat_id)?;
-            self.docker.restart(&spec).await?;
+            let (spec, token_state) = self.spec_for_chat_with_token_state(chat_id)?;
+            if should_recreate_sandbox_for_token_state(token_state) {
+                self.docker.rebuild(&spec, false).await?;
+            } else {
+                self.docker.restart(&spec).await?;
+            }
             self.spawn_and_register_session(&spec).await
         })
         .await
@@ -377,6 +415,10 @@ where
         })
         .await
     }
+}
+
+fn should_recreate_sandbox_for_token_state(token_state: BrokerTokenState) -> bool {
+    token_state == BrokerTokenState::Generated
 }
 
 #[async_trait]
@@ -503,6 +545,40 @@ mod tests {
         assert!(!first.broker_token.is_empty());
         assert!(!second.broker_token.is_empty());
         assert_ne!(first.broker_token, second.broker_token);
+    }
+
+    #[test]
+    fn spec_for_chat_should_mark_first_process_token_as_generated() {
+        let (docker, codex, broker) = configs();
+        let (_telegram, router) = fake_runtime_router();
+        let manager = RuntimeManager::new(
+            DockerSandboxBackend,
+            docker,
+            codex,
+            broker,
+            Arc::new(router),
+            PtyReadPolicy::default(),
+        );
+
+        let (_first, first_token_state) = manager
+            .spec_for_chat_with_token_state(ChatId(1))
+            .expect("spec should build");
+        let (_second, second_token_state) = manager
+            .spec_for_chat_with_token_state(ChatId(1))
+            .expect("spec should build");
+
+        assert_eq!(first_token_state, BrokerTokenState::Generated);
+        assert_eq!(second_token_state, BrokerTokenState::Existing);
+    }
+
+    #[test]
+    fn newly_generated_broker_token_should_recreate_sandbox() {
+        assert!(should_recreate_sandbox_for_token_state(
+            BrokerTokenState::Generated
+        ));
+        assert!(!should_recreate_sandbox_for_token_state(
+            BrokerTokenState::Existing
+        ));
     }
 
     #[test]
