@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ip6tables_enabled=0
+if command -v ip6tables >/dev/null 2>&1 && ip6tables -L OUTPUT >/dev/null 2>&1; then
+  ip6tables -P OUTPUT ACCEPT
+  ip6tables_enabled=1
+fi
+
 while read -r directive nameserver _; do
   if [[ "$directive" == "nameserver" && -n "${nameserver:-}" && "$nameserver" != *:* ]]; then
     iptables -A OUTPUT -d "$nameserver" -p udp --dport 53 -j ACCEPT
@@ -15,7 +21,16 @@ iptables -A OUTPUT -d "$docker_dns_ip" -p tcp --dport 53 -j ACCEPT
 if [[ -n "${TELELLM_BROKER_HOST:-}" ]]; then
   broker_ip="$(getent hosts "$TELELLM_BROKER_HOST" | awk '{ print $1 }' | head -n 1)"
   if [[ -n "$broker_ip" ]]; then
-    iptables -A OUTPUT -d "$broker_ip" -p tcp --dport "${TELELLM_BROKER_PORT:-8189}" -j ACCEPT
+    case "$broker_ip" in
+      *:*)
+        if [[ "$ip6tables_enabled" == "1" ]]; then
+          ip6tables -A OUTPUT -d "$broker_ip" -p tcp --dport "${TELELLM_BROKER_PORT:-8189}" -j ACCEPT
+        fi
+        ;;
+      *)
+        iptables -A OUTPUT -d "$broker_ip" -p tcp --dport "${TELELLM_BROKER_PORT:-8189}" -j ACCEPT
+        ;;
+    esac
   fi
 fi
 
@@ -30,6 +45,18 @@ for cidr in \
 do
   iptables -A OUTPUT -d "$cidr" -j REJECT
 done
+
+if [[ "$ip6tables_enabled" == "1" ]]; then
+  for cidr in \
+    ::/128 \
+    ::1/128 \
+    fc00::/7 \
+    fe80::/10 \
+    ff00::/8
+  do
+    ip6tables -A OUTPUT -d "$cidr" -j REJECT
+  done
+fi
 
 chown codex:codex /workspace
 

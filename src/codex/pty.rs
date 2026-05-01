@@ -2,24 +2,58 @@ use super::session::{CodexRequest, CodexSession, CodexSessionError, CodexTurn};
 use async_trait::async_trait;
 use portable_pty::{Child, CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::{
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
+use std::{sync::mpsc, thread};
+
+const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_MAX_TURN_TIMEOUT: Duration = Duration::from_secs(900);
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 512 * 1024;
 
 #[derive(Clone)]
 pub struct PtyCodexSession {
     inner: Arc<Mutex<PtyInner>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PtyReadPolicy {
+    pub first_byte_timeout: Duration,
+    pub inactivity_timeout: Duration,
+    pub max_turn_timeout: Duration,
+    pub max_output_bytes: usize,
+}
+
+impl Default for PtyReadPolicy {
+    fn default() -> Self {
+        Self {
+            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            inactivity_timeout: DEFAULT_INACTIVITY_TIMEOUT,
+            max_turn_timeout: DEFAULT_MAX_TURN_TIMEOUT,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        }
+    }
+}
+
 struct PtyInner {
     _child: Box<dyn Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
-    reader: Box<dyn Read + Send>,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+    read_policy: PtyReadPolicy,
 }
 
 impl PtyCodexSession {
     pub fn spawn(command: &str, args: &[String]) -> Result<Self, CodexSessionError> {
+        Self::spawn_with_read_policy(command, args, PtyReadPolicy::default())
+    }
+
+    pub fn spawn_with_read_policy(
+        command: &str,
+        args: &[String],
+        read_policy: PtyReadPolicy,
+    ) -> Result<Self, CodexSessionError> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
@@ -47,12 +81,14 @@ impl PtyCodexSession {
             .master
             .try_clone_reader()
             .map_err(|err| CodexSessionError::Pty(err.to_string()))?;
+        let output_rx = spawn_reader_thread(reader);
 
         Ok(Self {
             inner: Arc::new(Mutex::new(PtyInner {
                 _child: child,
                 writer,
-                reader,
+                output_rx,
+                read_policy,
             })),
         })
     }
@@ -66,6 +102,7 @@ impl CodexSession for PtyCodexSession {
             let mut guard = inner
                 .lock()
                 .map_err(|_| CodexSessionError::Pty("pty mutex poisoned".to_owned()))?;
+            guard.drain_stale_output();
             guard
                 .writer
                 .write_all(request.prompt.as_bytes())
@@ -79,14 +116,8 @@ impl CodexSession for PtyCodexSession {
                 CodexSessionError::Pty(format!("failed flushing pty writer: {err}"))
             })?;
 
-            std::thread::sleep(Duration::from_millis(100));
-            let mut buf = [0_u8; 4096];
-            let bytes = guard
-                .reader
-                .read(&mut buf)
-                .map_err(|err| CodexSessionError::Pty(format!("failed reading pty: {err}")))?;
             Ok(CodexTurn {
-                output: String::from_utf8_lossy(&buf[..bytes]).into_owned(),
+                output: guard.read_turn_output(&request.prompt)?,
             })
         })
         .await
@@ -97,5 +128,170 @@ impl CodexSession for PtyCodexSession {
         Err(CodexSessionError::Pty(
             "restart requires the router to replace the PTY session".to_owned(),
         ))
+    }
+}
+
+impl PtyInner {
+    fn drain_stale_output(&mut self) {
+        while self.output_rx.try_recv().is_ok() {}
+    }
+
+    fn read_turn_output(&mut self, prompt: &str) -> Result<String, CodexSessionError> {
+        let deadline = Instant::now() + self.read_policy.max_turn_timeout;
+        let mut output = Vec::new();
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(CodexSessionError::Pty(
+                    "timed out waiting for Codex turn to become idle".to_owned(),
+                ));
+            }
+
+            let idle_timeout = if output.is_empty() {
+                self.read_policy.first_byte_timeout
+            } else {
+                self.read_policy.inactivity_timeout
+            };
+            let timeout = idle_timeout.min(deadline.saturating_duration_since(now));
+
+            match self.output_rx.recv_timeout(timeout) {
+                Ok(chunk) => {
+                    output.extend_from_slice(&chunk);
+                    if output.len() > self.read_policy.max_output_bytes {
+                        return Err(CodexSessionError::Pty(format!(
+                            "Codex turn exceeded {} bytes of PTY output",
+                            self.read_policy.max_output_bytes
+                        )));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if output.is_empty() => {
+                    return Err(CodexSessionError::Pty(
+                        "timed out waiting for Codex output".to_owned(),
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Ok(clean_pty_output(prompt, &output));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) if output.is_empty() => {
+                    return Err(CodexSessionError::Closed);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(clean_pty_output(prompt, &output));
+                }
+            }
+        }
+    }
+}
+
+fn spawn_reader_thread(mut reader: Box<dyn Read + Send>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(bytes) => {
+                    if tx.send(buf[..bytes].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+fn clean_pty_output(prompt: &str, output: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(output);
+    let normalized = normalize_newlines(&decoded);
+    let without_ansi = strip_ansi_sequences(&normalized);
+    strip_prompt_echo(prompt, &without_ansi)
+        .trim_matches('\n')
+        .to_owned()
+}
+
+fn normalize_newlines(input: &str) -> String {
+    input.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn strip_prompt_echo(prompt: &str, output: &str) -> String {
+    let normalized_prompt = normalize_newlines(prompt);
+    let prompt_lines: Vec<&str> = normalized_prompt.trim_matches('\n').lines().collect();
+    if prompt_lines.is_empty() {
+        return output.to_owned();
+    }
+
+    let mut output_lines = output.lines();
+    let mut remaining_prompt = prompt_lines.as_slice();
+    while let Some(prompt_line) = remaining_prompt.first() {
+        match output_lines.next() {
+            Some(output_line) if output_line.trim_end() == prompt_line.trim_end() => {
+                remaining_prompt = &remaining_prompt[1..];
+            }
+            Some(output_line) => {
+                let mut rebuilt = String::from(output_line);
+                for line in output_lines {
+                    rebuilt.push('\n');
+                    rebuilt.push_str(line);
+                }
+                return rebuilt;
+            }
+            None => return String::new(),
+        }
+    }
+
+    output_lines.collect::<Vec<_>>().join("\n")
+}
+
+fn strip_ansi_sequences(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    let mut previous_escape = false;
+                    for c in chars.by_ref() {
+                        if c == '\u{7}' || (previous_escape && c == '\\') {
+                            break;
+                        }
+                        previous_escape = c == '\u{1b}';
+                    }
+                }
+                Some(_) | None => {}
+            }
+            continue;
+        }
+
+        if ch == '\n' || ch == '\t' || !ch.is_control() {
+            output.push(ch);
+        }
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_pty_output_should_strip_prompt_echo_and_ansi_control_sequences() {
+        let raw = b"\x1b[?25lhello\r\n\x1b[32manswer\x1b[0m\r\n";
+
+        let cleaned = clean_pty_output("hello", raw);
+
+        assert_eq!(cleaned, "answer");
     }
 }

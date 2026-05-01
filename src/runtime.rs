@@ -7,7 +7,11 @@ use crate::{
     sandbox::{SandboxBackend, SandboxError, SandboxSpec, docker::DockerSandboxBackend},
 };
 use async_trait::async_trait;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 
 #[async_trait]
@@ -36,6 +40,7 @@ where
     broker_config: BrokerConfig,
     router: Arc<Router<PtyCodexSession, T>>,
     registered: Mutex<HashSet<ChatId>>,
+    startup_locks: Mutex<HashMap<ChatId, Arc<Mutex<()>>>>,
 }
 
 impl<T> RuntimeManager<T>
@@ -56,6 +61,7 @@ where
             broker_config,
             router,
             registered: Mutex::new(HashSet::new()),
+            startup_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -105,13 +111,52 @@ where
     }
 
     async fn ensure_chat_runtime_inner(&self, chat_id: ChatId) -> Result<(), RuntimeError> {
+        self.ensure_unregistered_chat_runtime(chat_id, async {
+            let spec = self.spec_for_chat(chat_id)?;
+            self.docker.ensure_started(&spec).await?;
+            self.spawn_and_register_session(&spec).await
+        })
+        .await
+    }
+
+    async fn ensure_unregistered_chat_runtime(
+        &self,
+        chat_id: ChatId,
+        start_runtime: impl Future<Output = Result<(), RuntimeError>>,
+    ) -> Result<(), RuntimeError> {
         if self.registered.lock().await.contains(&chat_id) {
             return Ok(());
         }
 
-        let spec = self.spec_for_chat(chat_id)?;
-        self.docker.ensure_started(&spec).await?;
-        self.spawn_and_register_session(&spec).await
+        let startup_lock = {
+            let mut startup_locks = self.startup_locks.lock().await;
+            startup_locks
+                .entry(chat_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let startup_guard = startup_lock.lock().await;
+
+        let result = if self.registered.lock().await.contains(&chat_id) {
+            Ok(())
+        } else {
+            start_runtime.await
+        };
+        drop(startup_guard);
+
+        self.remove_unused_startup_lock(chat_id, &startup_lock)
+            .await;
+        result
+    }
+
+    async fn remove_unused_startup_lock(&self, chat_id: ChatId, startup_lock: &Arc<Mutex<()>>) {
+        let mut startup_locks = self.startup_locks.lock().await;
+        let should_remove = startup_locks.get(&chat_id).is_some_and(|current| {
+            Arc::ptr_eq(current, startup_lock) && Arc::strong_count(startup_lock) == 2
+        });
+        if should_remove {
+            startup_locks.remove(&chat_id);
+        }
     }
 
     async fn reset_chat_runtime_inner(
@@ -191,7 +236,15 @@ pub enum RuntimeError {
 mod tests {
     use super::*;
     use crate::config::{BrokerConfig, CodexConfig, DockerConfig};
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::{Barrier, Notify};
 
     fn configs() -> (DockerConfig, CodexConfig, BrokerConfig) {
         (
@@ -259,6 +312,133 @@ mod tests {
         let args = DockerSandboxBackend::exec_args(&spec, &parts);
 
         assert!(args.contains(&"gpt-5-codex".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn ensure_unregistered_chat_runtime_should_serialize_same_chat_cold_start() {
+        let manager = Arc::new(runtime_manager());
+        let start_calls = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(Notify::new());
+        let second_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+
+        let first_manager = manager.clone();
+        let first_marker = manager.clone();
+        let first_calls = start_calls.clone();
+        let first_started_signal = first_started.clone();
+        let first_release = release_first.clone();
+        let first = tokio::spawn(async move {
+            first_manager
+                .ensure_unregistered_chat_runtime(ChatId(1), async move {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    first_started_signal.notify_one();
+                    first_release.notified().await;
+                    first_marker.registered.lock().await.insert(ChatId(1));
+                    Ok(())
+                })
+                .await
+        });
+
+        first_started.notified().await;
+
+        let second_manager = manager.clone();
+        let second_marker = manager.clone();
+        let second_calls = start_calls.clone();
+        let second_started_signal = second_started.clone();
+        let second = tokio::spawn(async move {
+            second_manager
+                .ensure_unregistered_chat_runtime(ChatId(1), async move {
+                    second_calls.fetch_add(1, Ordering::SeqCst);
+                    second_started_signal.notify_one();
+                    second_marker.registered.lock().await.insert(ChatId(1));
+                    Ok(())
+                })
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), second_started.notified())
+                .await
+                .is_err(),
+            "same-chat cold start should wait behind the in-flight start"
+        );
+        assert_eq!(start_calls.load(Ordering::SeqCst), 1);
+
+        release_first.notify_one();
+        first
+            .await
+            .expect("first task should join")
+            .expect("first cold start should succeed");
+        second
+            .await
+            .expect("second task should join")
+            .expect("second cold start should succeed");
+
+        assert_eq!(start_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_unregistered_chat_runtime_should_allow_different_chats_to_start_concurrently() {
+        let manager = Arc::new(runtime_manager());
+        let start_calls = Arc::new(AtomicUsize::new(0));
+        let both_started = Arc::new(Barrier::new(2));
+
+        let first_manager = manager.clone();
+        let first_marker = manager.clone();
+        let first_calls = start_calls.clone();
+        let first_barrier = both_started.clone();
+        let first = tokio::spawn(async move {
+            first_manager
+                .ensure_unregistered_chat_runtime(ChatId(1), async move {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    first_barrier.wait().await;
+                    first_marker.registered.lock().await.insert(ChatId(1));
+                    Ok(())
+                })
+                .await
+        });
+
+        let second_manager = manager.clone();
+        let second_marker = manager.clone();
+        let second_calls = start_calls.clone();
+        let second_barrier = both_started.clone();
+        let second = tokio::spawn(async move {
+            second_manager
+                .ensure_unregistered_chat_runtime(ChatId(2), async move {
+                    second_calls.fetch_add(1, Ordering::SeqCst);
+                    second_barrier.wait().await;
+                    second_marker.registered.lock().await.insert(ChatId(2));
+                    Ok(())
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first
+                .await
+                .expect("first task should join")
+                .expect("first cold start should succeed");
+            second
+                .await
+                .expect("second task should join")
+                .expect("second cold start should succeed");
+        })
+        .await
+        .expect("different chats should not block each other");
+
+        assert_eq!(start_calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn runtime_manager() -> RuntimeManager<FakeTelegram> {
+        let (docker, codex, broker) = configs();
+        let (_telegram, router) = fake_runtime_router();
+        RuntimeManager::new(
+            DockerSandboxBackend,
+            docker,
+            codex,
+            broker,
+            Arc::new(router),
+        )
     }
 
     fn fake_runtime_router() -> (

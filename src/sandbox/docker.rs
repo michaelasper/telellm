@@ -40,6 +40,7 @@ impl DockerSandboxBackend {
         let mut args = vec![
             "exec".to_owned(),
             "-i".to_owned(),
+            "-t".to_owned(),
             "--user".to_owned(),
             "codex".to_owned(),
             spec.sandbox_id.to_string(),
@@ -194,5 +195,20 @@ mod tests {
             args.windows(2)
                 .any(|window| window[0] == "--user" && window[1] == "codex")
         );
+    }
+
+    #[test]
+    fn exec_args_should_allocate_interactive_tty() {
+        let spec = SandboxSpec::new(ChatId(1), "telellm-sandbox:local", "telellm_public", "vol");
+
+        let args = DockerSandboxBackend::exec_args(&spec, &["codex"]);
+        let stdin_arg = args.iter().position(|arg| arg == "-i");
+        let tty_arg = args.iter().position(|arg| arg == "-t");
+        let user_arg = args.iter().position(|arg| arg == "--user");
+
+        assert!(matches!(
+            (stdin_arg, tty_arg, user_arg),
+            (Some(stdin), Some(tty), Some(user)) if stdin < tty && tty < user
+        ));
     }
 }

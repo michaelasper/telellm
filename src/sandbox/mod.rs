@@ -4,6 +4,8 @@ pub mod network;
 use crate::ids::{ChatId, SandboxId};
 use async_trait::async_trait;
 
+pub const SANDBOX_BEARER_TOKEN: &str = "telellm-sandbox-token";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxSpec {
     pub chat_id: ChatId,
@@ -29,7 +31,7 @@ impl SandboxSpec {
             broker_host: "host.docker.internal".to_owned(),
             broker_port: 8189,
             broker_base_url: "http://host.docker.internal:8189/v1".to_owned(),
-            broker_token: "telellm-sandbox-token".to_owned(),
+            broker_token: SANDBOX_BEARER_TOKEN.to_owned(),
         }
     }
 }
