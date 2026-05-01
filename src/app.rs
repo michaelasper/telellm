@@ -5,7 +5,7 @@ use crate::{
         telegram::{IncomingMessageHandler, TelegramError},
     },
     config::AppConfig,
-    memory::{MemoryStore, RollingBuffer, context::ContextPacket},
+    memory::{MemoryKind, MemoryStore, RollingBuffer, context::ContextPacket},
     router::{GroupWorkItem, Router, RouterError},
     runtime::RuntimeControl,
 };
@@ -193,6 +193,18 @@ where
                 )
                 .await?;
             }
+            BotCommand::Remember { content } => {
+                self.memory_store
+                    .add_memory(
+                        message.chat_id,
+                        message.from,
+                        MemoryKind::Personality,
+                        &content,
+                    )
+                    .await?;
+                self.reply_text(message.chat_id, "Remembered that for this group.")
+                    .await?;
+            }
             BotCommand::Forget { target } => match target {
                 ForgetTarget::All => {
                     let removed = self.memory_store.forget_all(message.chat_id).await?;
@@ -287,7 +299,7 @@ pub enum AppError {
 }
 
 fn help_text() -> &'static str {
-    "Show concise help for /status /reset /restart /rebuild /memory /forget."
+    "Show concise help for /status /reset /restart /rebuild /memory /remember /forget."
 }
 
 fn user_visible_error(error: &AppError) -> Option<&'static str> {
@@ -402,6 +414,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remember_should_write_memory_without_runtime() {
+        let (app, runtime, mut messages) = app_with_fakes().await;
+
+        app.handle_message(incoming("/remember Mike likes short answers"))
+            .await
+            .expect("remember should work");
+
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(app.memory_store.remembered.load(Ordering::SeqCst), 1);
+        assert!(messages.recv().await.expect("reply").contains("Remembered"));
+    }
+
+    #[tokio::test]
     async fn runtime_start_failure_should_send_telegram_error() {
         let (app, _runtime, mut messages) = app_with_failing_runtime().await;
 
@@ -478,6 +503,7 @@ mod tests {
     #[derive(Default)]
     struct FakeMemoryStore {
         forgotten: AtomicUsize,
+        remembered: AtomicUsize,
     }
 
     #[async_trait]
@@ -489,6 +515,7 @@ mod tests {
             kind: MemoryKind,
             content: &str,
         ) -> Result<MemoryRecord, MemoryStoreError> {
+            self.remembered.fetch_add(1, Ordering::SeqCst);
             Ok(MemoryRecord {
                 id: 1,
                 chat_id,

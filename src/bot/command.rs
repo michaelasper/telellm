@@ -6,6 +6,7 @@ pub enum BotCommand {
     Restart,
     Rebuild { clear_workspace: bool },
     Memory,
+    Remember { content: String },
     Forget { target: ForgetTarget },
 }
 
@@ -58,6 +59,14 @@ impl BotCommand {
                 clear_workspace: rest.contains("--clear-workspace"),
             })),
             "memory" => Ok(Some(Self::Memory)),
+            "remember" => {
+                if rest.is_empty() {
+                    return Err(CommandParseError::MissingArgument("/remember"));
+                }
+                Ok(Some(Self::Remember {
+                    content: rest.to_owned(),
+                }))
+            }
             "forget" => {
                 if rest.is_empty() {
                     return Err(CommandParseError::MissingArgument("/forget"));
@@ -113,6 +122,19 @@ mod tests {
             parsed,
             Some(BotCommand::Forget {
                 target: ForgetTarget::Query("Mike hates cilantro".to_owned())
+            })
+        );
+    }
+
+    #[test]
+    fn parse_should_capture_remember() {
+        let parsed = BotCommand::parse("/remember Mike likes short answers", "telellm_bot")
+            .expect("parse should succeed");
+
+        assert_eq!(
+            parsed,
+            Some(BotCommand::Remember {
+                content: "Mike likes short answers".to_owned()
             })
         );
     }

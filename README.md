@@ -44,6 +44,10 @@ cargo run -- doctor --config config.toml --create-network
 cargo run -- run --config config.toml
 ```
 
+## Group Commands
+
+`/remember <fact>` stores a host-managed group memory record. The sandbox can see remembered facts as prompt context, but cannot directly edit the host memory database.
+
 ## Security Model
 
 Each Telegram group maps to a Docker/Colima sandbox and persistent workspace volume. The daemon owns Telegram credentials, durable memory, and long-lived provider credentials. The sandbox receives only scoped access to the host broker and must not receive arbitrary host mounts or the Docker socket.
