@@ -30,6 +30,8 @@ For addressed non-command messages, the daemon builds a context packet:
 - The replied-to message, when Telegram provided one.
 - The triggering message.
 
+If the addressed message or its replied-to message includes Telegram photos or documents, the daemon downloads each attachment on the host, copies it into the chat sandbox under `/workspace/<attachments.workspace_dir>/msg-<message-id>/`, and renders the workspace path in the context packet as an `@...` file reference. Files that are too large or fail to download are rendered as skipped attachments with the reason.
+
 That rendered packet is sent to Codex as the prompt.
 
 ## Commands

@@ -34,6 +34,7 @@ mod tests {
             from: Some(UserId(2)),
             from_name: Some("Mike".to_owned()),
             text: "@telellm_bot hello".to_owned(),
+            attachments: Vec::new(),
             reply_to_bot: false,
             reply_to: None,
             private_chat: false,

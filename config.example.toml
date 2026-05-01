@@ -21,6 +21,11 @@ formatting_mode = "plain"
 formatting_escape = true
 formatting_fallback_to_plain = true
 
+[attachments]
+enabled = true
+workspace_dir = "telegram_uploads"
+max_file_bytes = 20000000
+
 [prompt]
 system_prompt = """
 You are the Telegram group assistant for this chat.

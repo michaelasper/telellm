@@ -1,5 +1,6 @@
 use super::{SandboxBackend, SandboxError, SandboxSpec};
 use async_trait::async_trait;
+use std::path::{Component, Path};
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Default)]
@@ -105,6 +106,87 @@ impl DockerSandboxBackend {
         ];
         args.extend(command.iter().map(|part| (*part).to_owned()));
         args
+    }
+
+    pub async fn copy_file_to_workspace(
+        &self,
+        spec: &SandboxSpec,
+        source_path: &Path,
+        workspace_path: &str,
+    ) -> Result<(), SandboxError> {
+        Self::validate_workspace_path(workspace_path)?;
+        let metadata = std::fs::metadata(source_path)?;
+        if !metadata.is_file() {
+            return Err(SandboxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("source path is not a file: {}", source_path.display()),
+            )));
+        }
+
+        let remote_path = format!("/workspace/{workspace_path}");
+        let remote_parent = remote_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("/workspace");
+
+        Self::docker(&[
+            "exec".to_owned(),
+            "--user".to_owned(),
+            "root".to_owned(),
+            spec.sandbox_id.to_string(),
+            "mkdir".to_owned(),
+            "-p".to_owned(),
+            remote_parent.to_owned(),
+        ])
+        .await?;
+        Self::docker(&[
+            "cp".to_owned(),
+            source_path.display().to_string(),
+            format!("{}:{remote_path}", spec.sandbox_id),
+        ])
+        .await?;
+        Self::docker(&[
+            "exec".to_owned(),
+            "--user".to_owned(),
+            "root".to_owned(),
+            spec.sandbox_id.to_string(),
+            "chown".to_owned(),
+            "codex:codex".to_owned(),
+            remote_path,
+        ])
+        .await
+    }
+
+    fn validate_workspace_path(workspace_path: &str) -> Result<(), SandboxError> {
+        let path = Path::new(workspace_path);
+        if path.is_absolute() {
+            return Err(SandboxError::InvalidWorkspacePath {
+                path: workspace_path.to_owned(),
+                reason: "must be relative".to_owned(),
+            });
+        }
+
+        let mut has_normal_component = false;
+        for component in path.components() {
+            match component {
+                Component::Normal(_) => has_normal_component = true,
+                _ => {
+                    return Err(SandboxError::InvalidWorkspacePath {
+                        path: workspace_path.to_owned(),
+                        reason: "must not contain parent, root, or prefix components".to_owned(),
+                    });
+                }
+            }
+        }
+
+        if !has_normal_component {
+            return Err(SandboxError::InvalidWorkspacePath {
+                path: workspace_path.to_owned(),
+                reason: "must contain a path component".to_owned(),
+            });
+        }
+
+        Ok(())
     }
 
     async fn docker_output(args: &[String]) -> Result<std::process::Output, SandboxError> {
@@ -411,6 +493,20 @@ mod tests {
         assert!(args.contains(&"-i".to_owned()));
         assert!(!args.contains(&"-t".to_owned()));
         assert!(args.contains(&"exec".to_owned()));
+    }
+
+    #[test]
+    fn validate_workspace_path_should_accept_nested_relative_paths() {
+        DockerSandboxBackend::validate_workspace_path("telegram_uploads/msg-1/photo.jpg")
+            .expect("workspace path should be valid");
+    }
+
+    #[test]
+    fn validate_workspace_path_should_reject_parent_components() {
+        let err = DockerSandboxBackend::validate_workspace_path("../secret.txt")
+            .expect_err("workspace path should be invalid");
+
+        assert!(matches!(err, SandboxError::InvalidWorkspacePath { .. }));
     }
 
     fn unique_temp_path(label: &str) -> std::path::PathBuf {

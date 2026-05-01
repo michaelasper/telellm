@@ -7,9 +7,66 @@ pub struct IncomingMessage {
     pub from: Option<UserId>,
     pub from_name: Option<String>,
     pub text: String,
+    pub attachments: Vec<IncomingAttachment>,
     pub reply_to_bot: bool,
     pub reply_to: Option<RepliedMessage>,
     pub private_chat: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingAttachment {
+    pub kind: AttachmentKind,
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size: u64,
+    pub workspace_path: Option<String>,
+    pub skipped_reason: Option<String>,
+}
+
+impl IncomingAttachment {
+    pub fn new(
+        kind: AttachmentKind,
+        file_id: String,
+        file_unique_id: String,
+        file_name: Option<String>,
+        mime_type: Option<String>,
+        file_size: u64,
+    ) -> Self {
+        Self {
+            kind,
+            file_id,
+            file_unique_id,
+            file_name,
+            mime_type,
+            file_size,
+            workspace_path: None,
+            skipped_reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Photo,
+    Document,
+}
+
+impl AttachmentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Photo => "photo",
+            Self::Document => "document",
+        }
+    }
+
+    pub fn default_file_name(self) -> &'static str {
+        match self {
+            Self::Photo => "photo.jpg",
+            Self::Document => "document",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +74,7 @@ pub struct RepliedMessage {
     pub message_id: MessageId,
     pub from_name: Option<String>,
     pub text: String,
+    pub attachments: Vec<IncomingAttachment>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +112,7 @@ mod tests {
             from: Some(UserId(9)),
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
+            attachments: Vec::new(),
             reply_to_bot: false,
             reply_to: None,
             private_chat: false,

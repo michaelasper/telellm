@@ -15,6 +15,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub telegram_ux: TelegramUxConfig,
     #[serde(default)]
+    pub attachments: AttachmentConfig,
+    #[serde(default)]
     pub prompt: PromptConfig,
     pub storage: StorageConfig,
     pub docker: DockerConfig,
@@ -58,6 +60,26 @@ pub struct TelegramUxConfig {
     pub formatting_escape: bool,
     #[serde(default = "default_true")]
     pub formatting_fallback_to_plain: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttachmentConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_attachment_workspace_dir")]
+    pub workspace_dir: String,
+    #[serde(default = "default_attachment_max_file_bytes")]
+    pub max_file_bytes: u64,
+}
+
+impl Default for AttachmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            workspace_dir: default_attachment_workspace_dir(),
+            max_file_bytes: default_attachment_max_file_bytes(),
+        }
+    }
 }
 
 impl Default for TelegramUxConfig {
@@ -205,6 +227,7 @@ impl AppConfig {
         require_non_empty("telegram.bot_token_env", &self.telegram.bot_token_env)?;
         require_non_empty("telegram.bot_username", &self.telegram.bot_username)?;
         validate_telegram_ux_config(&self.telegram_ux)?;
+        validate_attachment_config(&self.attachments)?;
         require_non_empty("prompt.system_prompt", &self.prompt.system_prompt)?;
         require_non_empty("docker.image", &self.docker.image)?;
         require_non_empty("docker.network", &self.docker.network)?;
@@ -350,6 +373,50 @@ fn validate_telegram_ux_config(telegram_ux: &TelegramUxConfig) -> Result<(), Con
     Ok(())
 }
 
+fn validate_attachment_config(attachments: &AttachmentConfig) -> Result<(), ConfigError> {
+    require_non_empty("attachments.workspace_dir", &attachments.workspace_dir)?;
+    validate_relative_workspace_path("attachments.workspace_dir", &attachments.workspace_dir)?;
+    if attachments.max_file_bytes == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "attachments.max_file_bytes",
+            reason: "must be greater than zero",
+        });
+    }
+    Ok(())
+}
+
+fn validate_relative_workspace_path(field: &'static str, value: &str) -> Result<(), ConfigError> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Err(ConfigError::InvalidValue {
+            field,
+            reason: "must be a relative workspace path",
+        });
+    }
+
+    let mut has_normal_component = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => has_normal_component = true,
+            _ => {
+                return Err(ConfigError::InvalidValue {
+                    field,
+                    reason: "must not contain parent, root, or prefix components",
+                });
+            }
+        }
+    }
+
+    if !has_normal_component {
+        return Err(ConfigError::InvalidValue {
+            field,
+            reason: "must contain a path component",
+        });
+    }
+
+    Ok(())
+}
+
 fn path_is_empty_or_whitespace(path: &Path) -> bool {
     path.as_os_str().is_empty() || path.to_string_lossy().trim().is_empty()
 }
@@ -486,6 +553,14 @@ fn default_formatting_mode() -> TelegramFormatMode {
     TelegramFormatMode::Plain
 }
 
+fn default_attachment_workspace_dir() -> String {
+    "telegram_uploads".to_owned()
+}
+
+fn default_attachment_max_file_bytes() -> u64 {
+    20_000_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +693,34 @@ mod tests {
     }
 
     #[test]
+    fn from_toml_str_should_apply_default_attachment_config() {
+        let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
+
+        assert!(config.attachments.enabled);
+        assert_eq!(config.attachments.workspace_dir, "telegram_uploads");
+        assert_eq!(config.attachments.max_file_bytes, 20_000_000);
+    }
+
+    #[test]
+    fn from_toml_str_should_parse_configured_attachment_config() {
+        let raw = valid_config().replace(
+            "[storage]",
+            r#"[attachments]
+enabled = false
+workspace_dir = "uploads/from_telegram"
+max_file_bytes = 1024
+
+[storage]"#,
+        );
+
+        let config = AppConfig::from_toml_str(&raw).expect("config should parse");
+
+        assert!(!config.attachments.enabled);
+        assert_eq!(config.attachments.workspace_dir, "uploads/from_telegram");
+        assert_eq!(config.attachments.max_file_bytes, 1024);
+    }
+
+    #[test]
     fn from_toml_str_should_parse_configured_telegram_ux() {
         let raw = valid_config().replace(
             "[storage]",
@@ -682,6 +785,33 @@ formatting_fallback_to_plain = false
         assert_eq!(
             err.to_string(),
             "config field `telegram_ux.streaming_max_chars` is invalid: must be at least 256"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_absolute_attachment_workspace_dir() {
+        let raw = format!(
+            "{}\n[attachments]\nworkspace_dir = \"/tmp/uploads\"\n",
+            valid_config()
+        );
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `attachments.workspace_dir` is invalid: must be a relative workspace path"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_zero_attachment_max_file_bytes() {
+        let raw = format!("{}\n[attachments]\nmax_file_bytes = 0\n", valid_config());
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `attachments.max_file_bytes` is invalid: must be greater than zero"
         );
     }
 

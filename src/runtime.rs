@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    path::Path,
     sync::{Arc, Mutex as StdMutex},
 };
 use tokio::sync::Mutex;
@@ -35,6 +36,12 @@ exit "$status"
 #[async_trait]
 pub trait RuntimeControl: Send + Sync {
     async fn ensure_chat_runtime(&self, chat_id: ChatId) -> Result<(), RuntimeError>;
+    async fn import_chat_attachment(
+        &self,
+        chat_id: ChatId,
+        source_path: &Path,
+        workspace_path: &str,
+    ) -> Result<(), RuntimeError>;
     async fn reset_chat_runtime(
         &self,
         chat_id: ChatId,
@@ -373,6 +380,19 @@ where
         .await
     }
 
+    async fn import_chat_attachment_inner(
+        &self,
+        chat_id: ChatId,
+        source_path: &Path,
+        workspace_path: &str,
+    ) -> Result<(), RuntimeError> {
+        let spec = self.spec_for_chat(chat_id)?;
+        self.docker
+            .copy_file_to_workspace(&spec, source_path, workspace_path)
+            .await?;
+        Ok(())
+    }
+
     async fn ensure_unregistered_chat_runtime(
         &self,
         chat_id: ChatId,
@@ -556,6 +576,16 @@ where
 {
     async fn ensure_chat_runtime(&self, chat_id: ChatId) -> Result<(), RuntimeError> {
         self.ensure_chat_runtime_inner(chat_id).await
+    }
+
+    async fn import_chat_attachment(
+        &self,
+        chat_id: ChatId,
+        source_path: &Path,
+        workspace_path: &str,
+    ) -> Result<(), RuntimeError> {
+        self.import_chat_attachment_inner(chat_id, source_path, workspace_path)
+            .await
     }
 
     async fn reset_chat_runtime(
@@ -899,6 +929,7 @@ mod tests {
                 allowed_chat_ids: Vec::new(),
             },
             telegram_ux: crate::config::TelegramUxConfig::default(),
+            attachments: crate::config::AttachmentConfig::default(),
             prompt: crate::config::PromptConfig::default(),
             storage: StorageConfig {
                 sqlite_path: "data/telellm.sqlite".into(),

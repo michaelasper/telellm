@@ -53,8 +53,43 @@ fn push_message_line(output: &mut String, message: &IncomingMessage) {
     output.push_str("- ");
     output.push_str(name);
     output.push_str(": ");
-    output.push_str(&message.text);
+    if message.text.is_empty() {
+        output.push_str("(no text)");
+    } else {
+        output.push_str(&message.text);
+    }
     output.push('\n');
+    push_attachments(output, &message.attachments);
+}
+
+fn push_attachments(output: &mut String, attachments: &[crate::bot::message::IncomingAttachment]) {
+    for attachment in attachments {
+        output.push_str("  attachment: ");
+        output.push_str(attachment.kind.as_str());
+        if let Some(file_name) = &attachment.file_name {
+            output.push_str(" `");
+            output.push_str(file_name);
+            output.push('`');
+        }
+        if let Some(mime_type) = &attachment.mime_type {
+            output.push_str(" (");
+            output.push_str(mime_type);
+            output.push(')');
+        }
+        output.push_str(", ");
+        output.push_str(&attachment.file_size.to_string());
+        output.push_str(" bytes");
+        if let Some(workspace_path) = &attachment.workspace_path {
+            output.push_str(", available at @");
+            output.push_str(workspace_path);
+        } else if let Some(reason) = &attachment.skipped_reason {
+            output.push_str(", not downloaded: ");
+            output.push_str(reason);
+        } else {
+            output.push_str(", not downloaded");
+        }
+        output.push('\n');
+    }
 }
 
 fn push_replied_message_line(output: &mut String, message: &crate::bot::message::RepliedMessage) {
@@ -62,14 +97,20 @@ fn push_replied_message_line(output: &mut String, message: &crate::bot::message:
     output.push_str("- ");
     output.push_str(name);
     output.push_str(": ");
-    output.push_str(&message.text);
+    if message.text.is_empty() {
+        output.push_str("(no text)");
+    } else {
+        output.push_str(&message.text);
+    }
     output.push('\n');
+    push_attachments(output, &message.attachments);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        bot::message::{AttachmentKind, IncomingAttachment},
         ids::{ChatId, MessageId, UserId},
         memory::store::MemoryKind,
     };
@@ -81,6 +122,7 @@ mod tests {
             from: Some(UserId(2)),
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
+            attachments: Vec::new(),
             reply_to_bot: false,
             reply_to: None,
             private_chat: false,
@@ -128,6 +170,7 @@ mod tests {
             message_id: MessageId(7),
             from_name: Some("beru".to_owned()),
             text: "Of course I know about the commune, Nick.".to_owned(),
+            attachments: Vec::new(),
         });
         let packet = ContextPacket {
             system_prompt: "Answer the trigger.".to_owned(),
@@ -140,5 +183,31 @@ mod tests {
 
         assert!(rendered.contains("Reply context:\n- beru: Of course I know about the commune"));
         assert!(rendered.contains("Triggering message:\n- Mike: HUAC?"));
+    }
+
+    #[test]
+    fn render_should_include_attachment_workspace_paths() {
+        let mut trigger = message("what is in this image?");
+        trigger.attachments.push(IncomingAttachment {
+            kind: AttachmentKind::Photo,
+            file_id: "file-id".to_owned(),
+            file_unique_id: "unique-id".to_owned(),
+            file_name: Some("photo.jpg".to_owned()),
+            mime_type: Some("image/jpeg".to_owned()),
+            file_size: 123,
+            workspace_path: Some("telegram_uploads/msg-1/1-photo.jpg".to_owned()),
+            skipped_reason: None,
+        });
+        let packet = ContextPacket {
+            system_prompt: "Answer the trigger.".to_owned(),
+            triggering_message: trigger,
+            recent_messages: Vec::new(),
+            memories: Vec::new(),
+        };
+
+        let rendered = packet.render();
+
+        assert!(rendered.contains("attachment: photo `photo.jpg` (image/jpeg), 123 bytes"));
+        assert!(rendered.contains("available at @telegram_uploads/msg-1/1-photo.jpg"));
     }
 }

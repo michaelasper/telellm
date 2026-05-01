@@ -35,6 +35,18 @@ All fields are optional. The section controls Telegram-facing behavior for Codex
 
 `typing_refresh_secs`, `streaming_update_interval_millis`, and `streaming_min_delta_chars` must be greater than zero. `streaming_max_chars` must be at least `256`.
 
+## `[attachments]`
+
+All fields are optional. The section controls Telegram photos and documents that are sent in addressed messages or DMs.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | Downloads addressed Telegram photos and documents and imports them into the chat workspace. |
+| `workspace_dir` | string | `telegram_uploads` | Relative directory under `/workspace` where imported attachments are stored. |
+| `max_file_bytes` | integer | `20000000` | Maximum Telegram file size to download. Larger files are noted in prompt context but not imported. |
+
+`workspace_dir` must be a non-empty relative path without parent directory components. `max_file_bytes` must be greater than zero.
+
 ## `[prompt]`
 
 | Field | Type | Required | Default In Example | Description |

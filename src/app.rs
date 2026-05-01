@@ -1,10 +1,10 @@
 use crate::{
     bot::{
         command::{BotCommand, ForgetTarget},
-        message::{Addressing, IncomingMessage},
+        message::{Addressing, IncomingAttachment, IncomingMessage},
         telegram::{IncomingMessageHandler, TelegramError},
     },
-    config::{AppConfig, CodexAuthMode},
+    config::{AppConfig, AttachmentConfig, CodexAuthMode},
     memory::{MemoryKind, MemoryStore, RollingBuffer, context::ContextPacket},
     router::{GroupWorkItem, Router, RouterError},
     runtime::{ChatRuntimeStatus, RuntimeControl, RuntimeState},
@@ -12,7 +12,11 @@ use crate::{
 use anyhow::Context;
 use async_trait::async_trait;
 use secrecy::ExposeSecret;
-use std::sync::Arc;
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::Mutex;
 
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
@@ -82,6 +86,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         system_prompt: config.prompt.system_prompt.clone(),
         allowed_chat_ids,
         queue_ack_enabled: config.telegram_ux.queue_ack_enabled,
+        attachments: config.attachments.clone(),
     };
     let app_core = Arc::new(AppCore::new(
         app_core_config,
@@ -106,6 +111,7 @@ where
     system_prompt: String,
     allowed_chat_ids: Vec<crate::ids::ChatId>,
     queue_ack_enabled: bool,
+    attachments: AttachmentConfig,
     memory_store: Arc<M>,
     rolling: Arc<Mutex<RollingBuffer>>,
     router: Arc<Router<S, T>>,
@@ -118,6 +124,7 @@ pub struct AppCoreConfig {
     pub system_prompt: String,
     pub allowed_chat_ids: Vec<crate::ids::ChatId>,
     pub queue_ack_enabled: bool,
+    pub attachments: AttachmentConfig,
 }
 
 impl<M, S, T, N> AppCore<M, S, T, N>
@@ -139,6 +146,7 @@ where
             system_prompt,
             allowed_chat_ids,
             queue_ack_enabled,
+            attachments,
         } = config;
 
         Self {
@@ -146,6 +154,7 @@ where
             system_prompt,
             allowed_chat_ids,
             queue_ack_enabled,
+            attachments,
             memory_store,
             rolling: Arc::new(Mutex::new(rolling)),
             router,
@@ -153,8 +162,7 @@ where
         }
     }
 
-    pub async fn handle_message(&self, message: IncomingMessage) -> Result<(), AppError> {
-        self.rolling.lock().await.push(message.clone());
+    pub async fn handle_message(&self, mut message: IncomingMessage) -> Result<(), AppError> {
         let command = BotCommand::parse(&message.text, &self.bot_username)?;
 
         if !self.chat_allowed(message.chat_id) {
@@ -162,14 +170,18 @@ where
         }
 
         if command.is_none() && message.addressing(&self.bot_username) == Addressing::Ambient {
+            self.rolling.lock().await.push(message);
             return Ok(());
         }
 
         if let Some(command) = command {
+            self.rolling.lock().await.push(message.clone());
             return self.handle_command(message, command).await;
         }
 
         self.runtime.ensure_chat_runtime(message.chat_id).await?;
+        self.prepare_attachments(&mut message).await;
+        self.rolling.lock().await.push(message.clone());
 
         let recent_messages = self.rolling.lock().await.recent_for_chat(message.chat_id);
         let memories = self.memory_store.list_memories(message.chat_id).await?;
@@ -274,6 +286,116 @@ where
         Ok(())
     }
 
+    async fn prepare_attachments(&self, message: &mut IncomingMessage) {
+        self.prepare_attachment_list(
+            message.chat_id,
+            message.message_id,
+            &mut message.attachments,
+        )
+        .await;
+        if let Some(reply_to) = &mut message.reply_to {
+            self.prepare_attachment_list(
+                message.chat_id,
+                reply_to.message_id,
+                &mut reply_to.attachments,
+            )
+            .await;
+        }
+    }
+
+    async fn prepare_attachment_list(
+        &self,
+        chat_id: crate::ids::ChatId,
+        message_id: crate::ids::MessageId,
+        attachments: &mut [IncomingAttachment],
+    ) {
+        if attachments.is_empty() {
+            return;
+        }
+
+        if !self.attachments.enabled {
+            for attachment in attachments {
+                attachment.skipped_reason =
+                    Some("attachment downloads are disabled by configuration".to_owned());
+            }
+            return;
+        }
+
+        for (index, attachment) in attachments.iter_mut().enumerate() {
+            match self
+                .import_attachment(chat_id, message_id, index, attachment)
+                .await
+            {
+                Ok(workspace_path) => attachment.workspace_path = Some(workspace_path),
+                Err(reason) => {
+                    tracing::warn!(
+                        chat_id = ?chat_id,
+                        message_id = ?message_id,
+                        file_unique_id = %attachment.file_unique_id,
+                        reason = %reason,
+                        "failed to import Telegram attachment"
+                    );
+                    attachment.skipped_reason = Some(reason);
+                }
+            }
+        }
+    }
+
+    async fn import_attachment(
+        &self,
+        chat_id: crate::ids::ChatId,
+        message_id: crate::ids::MessageId,
+        index: usize,
+        attachment: &IncomingAttachment,
+    ) -> Result<String, String> {
+        if attachment.file_size > self.attachments.max_file_bytes {
+            return Err(format!(
+                "file size {} exceeds configured limit {} bytes",
+                attachment.file_size, self.attachments.max_file_bytes
+            ));
+        }
+
+        let workspace_path = attachment_workspace_path(
+            &self.attachments.workspace_dir,
+            message_id,
+            index,
+            attachment,
+        );
+        let temp_path = temp_attachment_path(message_id, index);
+        let result = async {
+            let downloaded_bytes = self
+                .router
+                .telegram()
+                .download_file_to_path(&attachment.file_id, &temp_path)
+                .await
+                .map_err(|err| err.to_string())?;
+            if downloaded_bytes > self.attachments.max_file_bytes {
+                return Err(format!(
+                    "downloaded file size {downloaded_bytes} exceeds configured limit {} bytes",
+                    self.attachments.max_file_bytes
+                ));
+            }
+            self.runtime
+                .import_chat_attachment(chat_id, &temp_path, &workspace_path)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(workspace_path)
+        }
+        .await;
+
+        if let Err(err) = tokio::fs::remove_file(&temp_path).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                error = %err,
+                path = %temp_path.display(),
+                "failed to remove temporary Telegram attachment"
+            );
+        }
+
+        result
+    }
+
     async fn enqueue_text(
         &self,
         chat_id: crate::ids::ChatId,
@@ -298,6 +420,57 @@ where
         }
         Ok(())
     }
+}
+
+fn attachment_workspace_path(
+    workspace_dir: &str,
+    message_id: crate::ids::MessageId,
+    index: usize,
+    attachment: &IncomingAttachment,
+) -> String {
+    let workspace_dir = workspace_dir.trim_matches('/');
+    let file_name = attachment
+        .file_name
+        .as_deref()
+        .unwrap_or_else(|| attachment.kind.default_file_name());
+    format!(
+        "{workspace_dir}/msg-{}/{}-{}",
+        message_id.0,
+        index + 1,
+        sanitize_file_name(file_name)
+    )
+}
+
+fn sanitize_file_name(file_name: &str) -> String {
+    let mut sanitized = String::with_capacity(file_name.len().min(128));
+    for ch in file_name.chars().take(128) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return "attachment".to_owned();
+    }
+    if sanitized.starts_with('.') {
+        return format!("attachment{sanitized}");
+    }
+    sanitized.to_owned()
+}
+
+fn temp_attachment_path(message_id: crate::ids::MessageId, index: usize) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "telellm-upload-{}-{}-{index}-{nanos}",
+        std::process::id(),
+        message_id.0
+    ))
 }
 
 #[async_trait]
@@ -379,6 +552,7 @@ fn status_text(status: ChatRuntimeStatus) -> String {
 mod tests {
     use super::*;
     use crate::{
+        bot::message::AttachmentKind,
         bot::telegram::{TelegramError, TelegramSink},
         codex::session::{CodexRequest, CodexSession, CodexSessionError, CodexTurn},
         ids::{ChatId, MessageId, UserId},
@@ -401,6 +575,7 @@ mod tests {
             from: Some(UserId(2)),
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
+            attachments: Vec::new(),
             reply_to_bot: false,
             reply_to: None,
             private_chat: false,
@@ -417,6 +592,7 @@ mod tests {
             system_prompt: test_system_prompt(),
             allowed_chat_ids,
             queue_ack_enabled,
+            attachments: AttachmentConfig::default(),
         }
     }
 
@@ -629,6 +805,67 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn addressed_message_should_import_attachment_and_render_workspace_path() {
+        let (app, runtime, mut messages) = app_with_fakes().await;
+        let mut message = incoming("@telellm_bot describe this");
+        message.attachments.push(IncomingAttachment::new(
+            AttachmentKind::Photo,
+            "telegram-file-id".to_owned(),
+            "telegram-unique-id".to_owned(),
+            Some("cat.jpg".to_owned()),
+            Some("image/jpeg".to_owned()),
+            15,
+        ));
+
+        app.handle_message(message)
+            .await
+            .expect("addressed message should be handled");
+        let response = messages.recv().await.expect("response should be sent");
+        let imported = runtime.imported.lock().await;
+
+        assert_eq!(imported.len(), 1);
+        assert_eq!(
+            imported[0].workspace_path,
+            "telegram_uploads/msg-1/1-cat.jpg"
+        );
+        assert_eq!(imported[0].bytes, b"fake attachment bytes");
+        assert!(response.contains("available at @telegram_uploads/msg-1/1-cat.jpg"));
+    }
+
+    #[tokio::test]
+    async fn addressed_message_should_import_replied_attachment() {
+        let (app, runtime, mut messages) = app_with_fakes().await;
+        let mut message = incoming("@telellm_bot what is this?");
+        message.reply_to = Some(crate::bot::message::RepliedMessage {
+            message_id: MessageId(7),
+            from_name: Some("Mike".to_owned()),
+            text: String::new(),
+            attachments: vec![IncomingAttachment::new(
+                AttachmentKind::Document,
+                "telegram-file-id".to_owned(),
+                "telegram-unique-id".to_owned(),
+                Some("diagram.png".to_owned()),
+                Some("image/png".to_owned()),
+                15,
+            )],
+        });
+
+        app.handle_message(message)
+            .await
+            .expect("addressed message should be handled");
+        let response = messages.recv().await.expect("response should be sent");
+        let imported = runtime.imported.lock().await;
+
+        assert_eq!(imported.len(), 1);
+        assert_eq!(
+            imported[0].workspace_path,
+            "telegram_uploads/msg-7/1-diagram.png"
+        );
+        assert!(response.contains("Reply context:\n- Mike: (no text)"));
+        assert!(response.contains("available at @telegram_uploads/msg-7/1-diagram.png"));
+    }
+
     async fn app_with_fakes() -> (
         AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
         Arc<FakeRuntime>,
@@ -808,12 +1045,30 @@ mod tests {
                 .send(text.to_owned())
                 .map_err(|err| TelegramError::Send(err.to_string()))
         }
+
+        async fn download_file_to_path(
+            &self,
+            _file_id: &str,
+            destination: &std::path::Path,
+        ) -> Result<u64, TelegramError> {
+            tokio::fs::write(destination, b"fake attachment bytes")
+                .await
+                .map_err(|err| TelegramError::Download(err.to_string()))?;
+            Ok(21)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ImportedAttachment {
+        workspace_path: String,
+        bytes: Vec<u8>,
     }
 
     struct FakeRuntime {
         ensure_calls: AtomicUsize,
         reset_calls: AtomicUsize,
         fail_ensure: std::sync::atomic::AtomicBool,
+        imported: Mutex<Vec<ImportedAttachment>>,
         status: Mutex<ChatRuntimeStatus>,
     }
 
@@ -823,6 +1078,7 @@ mod tests {
                 ensure_calls: AtomicUsize::new(0),
                 reset_calls: AtomicUsize::new(0),
                 fail_ensure: std::sync::atomic::AtomicBool::new(false),
+                imported: Mutex::new(Vec::new()),
                 status: Mutex::new(ChatRuntimeStatus {
                     chat_id: ChatId(1),
                     state: RuntimeState::Ready,
@@ -850,6 +1106,22 @@ mod tests {
                     "test runtime failure".to_owned(),
                 ));
             }
+            Ok(())
+        }
+
+        async fn import_chat_attachment(
+            &self,
+            _chat_id: ChatId,
+            source_path: &std::path::Path,
+            workspace_path: &str,
+        ) -> Result<(), crate::runtime::RuntimeError> {
+            let bytes = tokio::fs::read(source_path)
+                .await
+                .map_err(crate::sandbox::SandboxError::Io)?;
+            self.imported.lock().await.push(ImportedAttachment {
+                workspace_path: workspace_path.to_owned(),
+                bytes,
+            });
             Ok(())
         }
 

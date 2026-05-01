@@ -1,20 +1,23 @@
 use crate::{
+    bot::message::{AttachmentKind, IncomingAttachment},
     config::TelegramFormatMode,
     ids::{ChatId, MessageId},
 };
 use async_trait::async_trait;
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use teloxide::{
     dispatching::UpdateFilterExt,
     errors::AsResponseParameters,
+    net::Download,
     payloads::{EditMessageTextSetters, SendMessageSetters},
     prelude::*,
     types::{
-        BotCommand as TgBotCommand, ChatAction, ChatId as TgChatId, Message,
+        BotCommand as TgBotCommand, ChatAction, ChatId as TgChatId, FileId, Message,
         MessageId as TgMessageId, ParseMode, User,
     },
     utils::{html, markdown},
 };
+use tokio::io::AsyncWriteExt;
 
 const RETRY_AFTER_BUFFER: Duration = Duration::from_millis(250);
 
@@ -58,6 +61,16 @@ pub trait TelegramSink: Send + Sync {
     async fn send_typing_action(&self, _chat_id: ChatId) -> Result<(), TelegramError> {
         Ok(())
     }
+
+    async fn download_file_to_path(
+        &self,
+        _file_id: &str,
+        _destination: &Path,
+    ) -> Result<u64, TelegramError> {
+        Err(TelegramError::Download(
+            "telegram file downloads are not supported by this sink".to_owned(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +104,8 @@ pub enum TelegramError {
     Edit(String),
     #[error("telegram chat action failed: {0}")]
     ChatAction(String),
+    #[error("telegram file download failed: {0}")]
+    Download(String),
     #[error("telegram command registration failed: {0}")]
     CommandRegistration(String),
 }
@@ -305,6 +320,36 @@ impl TelegramSink for TeloxideTelegramSink {
             .map(|_| ())
             .map_err(|err| TelegramError::ChatAction(err.to_string()))
     }
+
+    async fn download_file_to_path(
+        &self,
+        file_id: &str,
+        destination: &Path,
+    ) -> Result<u64, TelegramError> {
+        let file = self
+            .bot
+            .get_file(FileId(file_id.to_owned()))
+            .await
+            .map_err(|err| TelegramError::Download(err.to_string()))?;
+        let mut destination = tokio::fs::File::create(destination)
+            .await
+            .map_err(|err| TelegramError::Download(err.to_string()))?;
+
+        self.bot
+            .download_file(&file.path, &mut destination)
+            .await
+            .map_err(|err| TelegramError::Download(err.to_string()))?;
+        destination
+            .flush()
+            .await
+            .map_err(|err| TelegramError::Download(err.to_string()))?;
+        let metadata = destination
+            .metadata()
+            .await
+            .map_err(|err| TelegramError::Download(err.to_string()))?;
+
+        Ok(metadata.len())
+    }
 }
 
 fn telegram_send_error(err: teloxide::RequestError) -> TelegramError {
@@ -414,7 +459,16 @@ fn normalize_message(
     message: &Message,
     bot_username: &str,
 ) -> Option<crate::bot::message::IncomingMessage> {
-    let text = message.text()?.to_owned();
+    let attachments = message_attachments(message);
+    let text = message
+        .text()
+        .or_else(|| message.caption())
+        .unwrap_or_default()
+        .to_owned();
+    if text.is_empty() && attachments.is_empty() {
+        return None;
+    }
+
     let from = message.from.as_ref().map(user_id);
     let from_name = message.from.as_ref().map(display_name);
     let replied_message = message.reply_to_message();
@@ -430,17 +484,58 @@ fn normalize_message(
         from,
         from_name,
         text,
+        attachments,
         reply_to_bot,
         reply_to,
         private_chat: message.chat.is_private(),
     })
 }
 
+fn message_attachments(message: &Message) -> Vec<IncomingAttachment> {
+    if let Some(photo) = message
+        .photo()
+        .and_then(|photos| photos.iter().max_by_key(|photo| photo.file.size))
+    {
+        return vec![IncomingAttachment::new(
+            AttachmentKind::Photo,
+            photo.file.id.0.clone(),
+            photo.file.unique_id.0.clone(),
+            Some("photo.jpg".to_owned()),
+            Some("image/jpeg".to_owned()),
+            u64::from(photo.file.size),
+        )];
+    }
+
+    if let Some(document) = message.document() {
+        return vec![IncomingAttachment::new(
+            AttachmentKind::Document,
+            document.file.id.0.clone(),
+            document.file.unique_id.0.clone(),
+            document.file_name.clone(),
+            document.mime_type.as_ref().map(ToString::to_string),
+            u64::from(document.file.size),
+        )];
+    }
+
+    Vec::new()
+}
+
 fn normalize_replied_message(message: &Message) -> Option<crate::bot::message::RepliedMessage> {
+    let attachments = message_attachments(message);
+    let text = message
+        .text()
+        .or_else(|| message.caption())
+        .unwrap_or_default()
+        .to_owned();
+    if text.is_empty() && attachments.is_empty() {
+        return None;
+    }
+
     Some(crate::bot::message::RepliedMessage {
         message_id: crate::ids::MessageId(message.id.0),
         from_name: message.from.as_ref().map(display_name),
-        text: message.text()?.to_owned(),
+        text,
+        attachments,
     })
 }
 

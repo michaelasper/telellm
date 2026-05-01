@@ -55,6 +55,8 @@ pub enum SandboxError {
     Io(#[from] std::io::Error),
     #[error("Codex auth host path `{}` is invalid: {reason}", path.display())]
     InvalidCodexAuthPath { path: PathBuf, reason: String },
+    #[error("workspace path `{path}` is invalid: {reason}")]
+    InvalidWorkspacePath { path: String, reason: String },
 }
 
 #[cfg(test)]
