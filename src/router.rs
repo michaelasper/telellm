@@ -18,9 +18,29 @@ where
     T: TelegramSink + 'static,
 {
     queue_depth: usize,
-    sessions: Arc<Mutex<HashMap<ChatId, Arc<S>>>>,
-    senders: Arc<Mutex<HashMap<ChatId, mpsc::Sender<GroupWorkItem>>>>,
+    sessions: Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
+    senders: Arc<Mutex<HashMap<ChatId, WorkerSender>>>,
     telegram: Arc<T>,
+}
+
+struct RegisteredSession<S> {
+    generation: u64,
+    session: Arc<S>,
+}
+
+impl<S> Clone for RegisteredSession<S> {
+    fn clone(&self) -> Self {
+        Self {
+            generation: self.generation,
+            session: self.session.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WorkerSender {
+    generation: u64,
+    sender: mpsc::Sender<GroupWorkItem>,
 }
 
 impl<S, T> Router<S, T>
@@ -41,8 +61,14 @@ where
         self.telegram.clone()
     }
 
-    pub async fn register_session(&self, chat_id: ChatId, session: Arc<S>) {
-        self.sessions.lock().await.insert(chat_id, session);
+    pub async fn register_session(&self, chat_id: ChatId, generation: u64, session: Arc<S>) {
+        self.sessions.lock().await.insert(
+            chat_id,
+            RegisteredSession {
+                generation,
+                session,
+            },
+        );
         self.senders.lock().await.remove(&chat_id);
     }
 
@@ -58,11 +84,7 @@ where
         &self,
         chat_id: ChatId,
     ) -> Result<mpsc::Sender<GroupWorkItem>, RouterError> {
-        if let Some(sender) = self.senders.lock().await.get(&chat_id).cloned() {
-            return Ok(sender);
-        }
-
-        let session = self
+        let registered = self
             .sessions
             .lock()
             .await
@@ -72,41 +94,68 @@ where
 
         let mut senders = self.senders.lock().await;
         if let Some(sender) = senders.get(&chat_id).cloned() {
-            return Ok(sender);
+            if sender.generation == registered.generation {
+                return Ok(sender.sender);
+            }
+            senders.remove(&chat_id);
         }
 
         let telegram = self.telegram.clone();
         let (tx, rx) = mpsc::channel(self.queue_depth);
-        Self::spawn_chat_worker(session, telegram, rx);
+        Self::spawn_chat_worker(
+            registered.session,
+            registered.generation,
+            self.sessions.clone(),
+            telegram,
+            rx,
+        );
 
-        senders.insert(chat_id, tx.clone());
+        senders.insert(
+            chat_id,
+            WorkerSender {
+                generation: registered.generation,
+                sender: tx.clone(),
+            },
+        );
         Ok(tx)
     }
 
-    fn spawn_chat_worker(session: Arc<S>, telegram: Arc<T>, mut rx: mpsc::Receiver<GroupWorkItem>) {
+    fn spawn_chat_worker(
+        session: Arc<S>,
+        generation: u64,
+        sessions: Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
+        telegram: Arc<T>,
+        mut rx: mpsc::Receiver<GroupWorkItem>,
+    ) {
         tokio::spawn(async move {
             while let Some(item) = rx.recv().await {
-                match session
-                    .send(CodexRequest {
-                        prompt: item.prompt,
-                    })
-                    .await
-                {
+                let GroupWorkItem { chat_id, prompt } = item;
+                if Self::worker_is_stale(&sessions, chat_id, generation).await {
+                    break;
+                }
+
+                let result = session.send(CodexRequest { prompt }).await;
+
+                if Self::worker_is_stale(&sessions, chat_id, generation).await {
+                    break;
+                }
+
+                match result {
                     Ok(turn) => {
-                        if let Err(err) = telegram.send_message(item.chat_id, &turn.output).await {
+                        if let Err(err) = telegram.send_message(chat_id, &turn.output).await {
                             tracing::warn!(
                                 error = %err,
-                                chat_id = ?item.chat_id,
+                                chat_id = ?chat_id,
                                 "failed to send Codex response to Telegram"
                             );
                         }
                     }
                     Err(err) => {
                         let text = format!("Codex session failed: {err}");
-                        if let Err(send_err) = telegram.send_message(item.chat_id, &text).await {
+                        if let Err(send_err) = telegram.send_message(chat_id, &text).await {
                             tracing::warn!(
                                 error = %send_err,
-                                chat_id = ?item.chat_id,
+                                chat_id = ?chat_id,
                                 "failed to send Codex failure to Telegram"
                             );
                         }
@@ -114,6 +163,18 @@ where
                 }
             }
         });
+    }
+
+    async fn worker_is_stale(
+        sessions: &Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
+        chat_id: ChatId,
+        generation: u64,
+    ) -> bool {
+        sessions
+            .lock()
+            .await
+            .get(&chat_id)
+            .is_none_or(|session| session.generation != generation)
     }
 }
 
@@ -161,6 +222,38 @@ mod tests {
                 max_active_sends: AtomicUsize::new(0),
                 prompts: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    struct SlowSession {
+        reply_prefix: &'static str,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl SlowSession {
+        fn new(reply_prefix: &'static str) -> Self {
+            Self {
+                reply_prefix,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CodexSession for SlowSession {
+        async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+
+            Ok(CodexTurn {
+                output: format!("{}: {}", self.reply_prefix, request.prompt),
+            })
+        }
+
+        async fn restart(&self) -> Result<(), CodexSessionError> {
+            Ok(())
         }
     }
 
@@ -213,7 +306,7 @@ mod tests {
         let (telegram, mut messages) = fake_telegram();
         let session = Arc::new(FakeSession::default());
         let router = Router::new(4, telegram);
-        router.register_session(ChatId(1), session).await;
+        router.register_session(ChatId(1), 1, session).await;
 
         router
             .enqueue(GroupWorkItem {
@@ -232,7 +325,7 @@ mod tests {
         let (telegram, mut messages) = fake_telegram();
         let session = Arc::new(FakeSession::default());
         let router = Arc::new(Router::new(4, telegram));
-        router.register_session(ChatId(1), session.clone()).await;
+        router.register_session(ChatId(1), 1, session.clone()).await;
 
         let first_router = router.clone();
         let first = tokio::spawn(async move {
@@ -273,7 +366,7 @@ mod tests {
         let first_session = Arc::new(FakeSession::with_reply_prefix("first"));
         let second_session = Arc::new(FakeSession::with_reply_prefix("second"));
         let router = Router::new(4, telegram);
-        router.register_session(ChatId(1), first_session).await;
+        router.register_session(ChatId(1), 1, first_session).await;
 
         router
             .enqueue(GroupWorkItem {
@@ -285,7 +378,7 @@ mod tests {
         let first_message = receive_message(&mut messages).await;
         assert_eq!(first_message, "first: before");
 
-        router.register_session(ChatId(1), second_session).await;
+        router.register_session(ChatId(1), 2, second_session).await;
         router
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
@@ -295,6 +388,49 @@ mod tests {
             .expect("second enqueue should work");
         let second_message = receive_message(&mut messages).await;
         assert_eq!(second_message, "second: after");
+    }
+
+    #[tokio::test]
+    async fn register_session_should_not_send_stale_generation_after_replacement() {
+        let (telegram, mut messages) = fake_telegram();
+        let first_session = Arc::new(SlowSession::new("first"));
+        let second_session = Arc::new(SlowSession::new("second"));
+        let router = Router::new(4, telegram);
+        router
+            .register_session(ChatId(1), 1, first_session.clone())
+            .await;
+
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "stale".to_owned(),
+            })
+            .await
+            .expect("first enqueue should work");
+        first_session.entered.notified().await;
+
+        router
+            .register_session(ChatId(1), 2, second_session.clone())
+            .await;
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "fresh".to_owned(),
+            })
+            .await
+            .expect("second enqueue should work");
+        second_session.entered.notified().await;
+        first_session.release.notify_one();
+        second_session.release.notify_one();
+
+        let message = receive_message(&mut messages).await;
+        assert_eq!(message, "second: fresh");
+        assert!(
+            timeout(Duration::from_millis(50), messages.recv())
+                .await
+                .is_err(),
+            "stale generation should not publish a Telegram response"
+        );
     }
 
     #[tokio::test]

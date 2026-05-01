@@ -7,7 +7,7 @@ use crate::{
     config::AppConfig,
     memory::{MemoryKind, MemoryStore, RollingBuffer, context::ContextPacket},
     router::{GroupWorkItem, Router, RouterError},
-    runtime::RuntimeControl,
+    runtime::{ChatRuntimeStatus, RuntimeControl, RuntimeState},
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -160,11 +160,9 @@ where
                 self.reply_text(message.chat_id, help_text()).await?;
             }
             BotCommand::Status => {
-                self.reply_text(
-                    message.chat_id,
-                    "Status: host-side status reporting is available. Detailed runtime health will be added in the next implementation task.",
-                )
-                .await?;
+                let status = self.runtime.chat_status(message.chat_id).await;
+                self.reply_text(message.chat_id, status_text(status))
+                    .await?;
             }
             BotCommand::Reset { clear_workspace } => {
                 self.runtime
@@ -314,6 +312,26 @@ fn user_visible_error(error: &AppError) -> Option<&'static str> {
     }
 }
 
+fn status_text(status: ChatRuntimeStatus) -> String {
+    match status.state {
+        RuntimeState::NotStarted => {
+            format!("Status: not started. Generation: {}.", status.generation)
+        }
+        RuntimeState::Starting => {
+            format!("Status: starting. Generation: {}.", status.generation)
+        }
+        RuntimeState::Ready => {
+            format!("Status: ready. Generation: {}.", status.generation)
+        }
+        RuntimeState::Degraded(reason) => {
+            format!(
+                "Status: degraded. Generation: {}. Reason: {reason}",
+                status.generation
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +445,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_should_report_degraded_runtime_without_codex_prompt() {
+        let (app, runtime, mut messages, codex) = app_with_fakes_and_session().await;
+        runtime
+            .set_status(ChatRuntimeStatus {
+                chat_id: ChatId(1),
+                state: RuntimeState::Degraded("docker unavailable".to_owned()),
+                generation: 7,
+            })
+            .await;
+
+        app.handle_message(incoming("/status"))
+            .await
+            .expect("status should reply");
+        let reply = messages.recv().await.expect("reply should be sent");
+
+        assert!(reply.contains("degraded"));
+        assert!(reply.contains("docker unavailable"));
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn runtime_start_failure_should_send_telegram_error() {
         let (app, _runtime, mut messages) = app_with_failing_runtime().await;
 
@@ -446,12 +486,21 @@ mod tests {
         Arc<FakeRuntime>,
         mpsc::UnboundedReceiver<String>,
     ) {
+        let (app, runtime, messages, _codex) = app_with_fakes_and_session().await;
+        (app, runtime, messages)
+    }
+
+    async fn app_with_fakes_and_session() -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+        Arc<FakeCodexSession>,
+    ) {
         let memory = Arc::new(FakeMemoryStore::default());
         let (telegram, messages) = FakeTelegram::new();
         let router = Arc::new(Router::new(4, telegram));
-        router
-            .register_session(ChatId(1), Arc::new(FakeCodexSession))
-            .await;
+        let codex = Arc::new(FakeCodexSession::default());
+        router.register_session(ChatId(1), 1, codex.clone()).await;
         let runtime = Arc::new(FakeRuntime::default());
         let app = AppCore::new(
             "telellm_bot".to_owned(),
@@ -461,7 +510,7 @@ mod tests {
             router,
             runtime.clone(),
         );
-        (app, runtime, messages)
+        (app, runtime, messages, codex)
     }
 
     async fn app_with_fakes_and_allowed_chats(
@@ -475,7 +524,7 @@ mod tests {
         let (telegram, messages) = FakeTelegram::new();
         let router = Arc::new(Router::new(4, telegram));
         router
-            .register_session(ChatId(1), Arc::new(FakeCodexSession))
+            .register_session(ChatId(1), 1, Arc::new(FakeCodexSession::default()))
             .await;
         let runtime = Arc::new(FakeRuntime::default());
         let app = AppCore::new(
@@ -544,11 +593,15 @@ mod tests {
         }
     }
 
-    struct FakeCodexSession;
+    #[derive(Default)]
+    struct FakeCodexSession {
+        prompts: AtomicUsize,
+    }
 
     #[async_trait]
     impl CodexSession for FakeCodexSession {
         async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
+            self.prompts.fetch_add(1, Ordering::SeqCst);
             Ok(CodexTurn {
                 output: request.prompt,
             })
@@ -579,11 +632,32 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeRuntime {
         ensure_calls: AtomicUsize,
         reset_calls: AtomicUsize,
         fail_ensure: std::sync::atomic::AtomicBool,
+        status: Mutex<ChatRuntimeStatus>,
+    }
+
+    impl Default for FakeRuntime {
+        fn default() -> Self {
+            Self {
+                ensure_calls: AtomicUsize::new(0),
+                reset_calls: AtomicUsize::new(0),
+                fail_ensure: std::sync::atomic::AtomicBool::new(false),
+                status: Mutex::new(ChatRuntimeStatus {
+                    chat_id: ChatId(1),
+                    state: RuntimeState::Ready,
+                    generation: 1,
+                }),
+            }
+        }
+    }
+
+    impl FakeRuntime {
+        async fn set_status(&self, status: ChatRuntimeStatus) {
+            *self.status.lock().await = status;
+        }
     }
 
     #[async_trait]
@@ -623,6 +697,12 @@ mod tests {
             _clear_workspace: bool,
         ) -> Result<(), crate::runtime::RuntimeError> {
             Ok(())
+        }
+
+        async fn chat_status(&self, chat_id: ChatId) -> ChatRuntimeStatus {
+            let mut status = self.status.lock().await.clone();
+            status.chat_id = chat_id;
+            status
         }
     }
 }

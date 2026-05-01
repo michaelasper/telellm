@@ -28,6 +28,37 @@ pub trait RuntimeControl: Send + Sync {
         chat_id: ChatId,
         clear_workspace: bool,
     ) -> Result<(), RuntimeError>;
+    async fn chat_status(&self, chat_id: ChatId) -> ChatRuntimeStatus;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatRuntimeStatus {
+    pub chat_id: ChatId,
+    pub state: RuntimeState,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeState {
+    NotStarted,
+    Starting,
+    Ready,
+    Degraded(String),
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeStatusRecord {
+    state: RuntimeState,
+    generation: u64,
+}
+
+impl Default for RuntimeStatusRecord {
+    fn default() -> Self {
+        Self {
+            state: RuntimeState::NotStarted,
+            generation: 0,
+        }
+    }
 }
 
 pub struct RuntimeManager<T>
@@ -41,7 +72,8 @@ where
     read_policy: PtyReadPolicy,
     router: Arc<Router<PtyCodexSession, T>>,
     registered: Mutex<HashSet<ChatId>>,
-    startup_locks: Mutex<HashMap<ChatId, Arc<Mutex<()>>>>,
+    lifecycle_locks: Mutex<HashMap<ChatId, Arc<Mutex<()>>>>,
+    statuses: Mutex<HashMap<ChatId, RuntimeStatusRecord>>,
 }
 
 impl<T> RuntimeManager<T>
@@ -64,7 +96,8 @@ where
             read_policy,
             router,
             registered: Mutex::new(HashSet::new()),
-            startup_locks: Mutex::new(HashMap::new()),
+            lifecycle_locks: Mutex::new(HashMap::new()),
+            statuses: Mutex::new(HashMap::new()),
         }
     }
 
@@ -117,7 +150,10 @@ where
             &docker_args,
             self.read_policy.clone(),
         )?);
-        self.router.register_session(spec.chat_id, session).await;
+        let generation = self.mark_ready_with_next_generation(spec.chat_id).await;
+        self.router
+            .register_session(spec.chat_id, generation, session)
+            .await;
         self.registered.lock().await.insert(spec.chat_id);
         Ok(())
     }
@@ -136,38 +172,116 @@ where
         chat_id: ChatId,
         start_runtime: impl Future<Output = Result<(), RuntimeError>>,
     ) -> Result<(), RuntimeError> {
-        if self.registered.lock().await.contains(&chat_id) {
-            return Ok(());
-        }
+        self.with_chat_lifecycle_lock(chat_id, async move {
+            if self.registered.lock().await.contains(&chat_id) {
+                return Ok(());
+            }
 
-        let startup_lock = {
-            let mut startup_locks = self.startup_locks.lock().await;
-            startup_locks
+            self.set_runtime_state(chat_id, RuntimeState::Starting)
+                .await;
+            let result = start_runtime.await;
+            self.record_lifecycle_result(chat_id, &result).await;
+            result
+        })
+        .await
+    }
+
+    async fn replace_chat_session(
+        &self,
+        chat_id: ChatId,
+        replace_session: impl Future<Output = Result<(), RuntimeError>>,
+    ) -> Result<(), RuntimeError> {
+        self.with_chat_lifecycle_lock(chat_id, async move {
+            self.set_runtime_state(chat_id, RuntimeState::Starting)
+                .await;
+            self.registered.lock().await.remove(&chat_id);
+            let result = replace_session.await;
+            self.record_lifecycle_result(chat_id, &result).await;
+            result
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn restart_chat_runtime_for_test(
+        &self,
+        chat_id: ChatId,
+        restart_runtime: impl Future<Output = Result<(), RuntimeError>>,
+    ) -> Result<(), RuntimeError> {
+        self.replace_chat_session(chat_id, restart_runtime).await
+    }
+
+    async fn with_chat_lifecycle_lock<R>(
+        &self,
+        chat_id: ChatId,
+        operation: impl Future<Output = R>,
+    ) -> R {
+        let lifecycle_lock = {
+            let mut lifecycle_locks = self.lifecycle_locks.lock().await;
+            lifecycle_locks
                 .entry(chat_id)
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let startup_guard = startup_lock.lock().await;
+        let lifecycle_guard = lifecycle_lock.lock().await;
 
-        let result = if self.registered.lock().await.contains(&chat_id) {
-            Ok(())
-        } else {
-            start_runtime.await
-        };
-        drop(startup_guard);
+        let result = operation.await;
+        drop(lifecycle_guard);
 
-        self.remove_unused_startup_lock(chat_id, &startup_lock)
+        self.remove_unused_lifecycle_lock(chat_id, &lifecycle_lock)
             .await;
         result
     }
 
-    async fn remove_unused_startup_lock(&self, chat_id: ChatId, startup_lock: &Arc<Mutex<()>>) {
-        let mut startup_locks = self.startup_locks.lock().await;
-        let should_remove = startup_locks.get(&chat_id).is_some_and(|current| {
-            Arc::ptr_eq(current, startup_lock) && Arc::strong_count(startup_lock) == 2
+    async fn remove_unused_lifecycle_lock(&self, chat_id: ChatId, lifecycle_lock: &Arc<Mutex<()>>) {
+        let mut lifecycle_locks = self.lifecycle_locks.lock().await;
+        let should_remove = lifecycle_locks.get(&chat_id).is_some_and(|current| {
+            Arc::ptr_eq(current, lifecycle_lock) && Arc::strong_count(lifecycle_lock) == 2
         });
         if should_remove {
-            startup_locks.remove(&chat_id);
+            lifecycle_locks.remove(&chat_id);
+        }
+    }
+
+    async fn mark_ready_with_next_generation(&self, chat_id: ChatId) -> u64 {
+        let mut statuses = self.statuses.lock().await;
+        let status = statuses.entry(chat_id).or_default();
+        status.generation += 1;
+        status.state = RuntimeState::Ready;
+        status.generation
+    }
+
+    async fn set_runtime_state(&self, chat_id: ChatId, state: RuntimeState) {
+        self.statuses.lock().await.entry(chat_id).or_default().state = state;
+    }
+
+    async fn record_lifecycle_result(&self, chat_id: ChatId, result: &Result<(), RuntimeError>) {
+        match result {
+            Ok(()) => {
+                let registered = self.registered.lock().await.contains(&chat_id);
+                if registered {
+                    self.set_runtime_state(chat_id, RuntimeState::Ready).await;
+                }
+            }
+            Err(error) => {
+                self.set_runtime_state(chat_id, RuntimeState::Degraded(error.to_string()))
+                    .await;
+            }
+        }
+    }
+
+    async fn chat_status_inner(&self, chat_id: ChatId) -> ChatRuntimeStatus {
+        let status = self
+            .statuses
+            .lock()
+            .await
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
+        ChatRuntimeStatus {
+            chat_id,
+            state: status.state,
+            generation: status.generation,
         }
     }
 
@@ -176,19 +290,25 @@ where
         chat_id: ChatId,
         clear_workspace: bool,
     ) -> Result<(), RuntimeError> {
-        let spec = self.spec_for_chat(chat_id)?;
-        if clear_workspace {
-            self.docker.rebuild(&spec, true).await?;
-        } else {
-            self.docker.ensure_started(&spec).await?;
-        }
-        self.spawn_and_register_session(&spec).await
+        self.replace_chat_session(chat_id, async move {
+            let spec = self.spec_for_chat(chat_id)?;
+            if clear_workspace {
+                self.docker.rebuild(&spec, true).await?;
+            } else {
+                self.docker.ensure_started(&spec).await?;
+            }
+            self.spawn_and_register_session(&spec).await
+        })
+        .await
     }
 
     async fn restart_chat_runtime_inner(&self, chat_id: ChatId) -> Result<(), RuntimeError> {
-        let spec = self.spec_for_chat(chat_id)?;
-        self.docker.restart(&spec).await?;
-        self.spawn_and_register_session(&spec).await
+        self.replace_chat_session(chat_id, async move {
+            let spec = self.spec_for_chat(chat_id)?;
+            self.docker.restart(&spec).await?;
+            self.spawn_and_register_session(&spec).await
+        })
+        .await
     }
 
     async fn rebuild_chat_runtime_inner(
@@ -196,9 +316,12 @@ where
         chat_id: ChatId,
         clear_workspace: bool,
     ) -> Result<(), RuntimeError> {
-        let spec = self.spec_for_chat(chat_id)?;
-        self.docker.rebuild(&spec, clear_workspace).await?;
-        self.spawn_and_register_session(&spec).await
+        self.replace_chat_session(chat_id, async move {
+            let spec = self.spec_for_chat(chat_id)?;
+            self.docker.rebuild(&spec, clear_workspace).await?;
+            self.spawn_and_register_session(&spec).await
+        })
+        .await
     }
 }
 
@@ -231,6 +354,10 @@ where
     ) -> Result<(), RuntimeError> {
         self.rebuild_chat_runtime_inner(chat_id, clear_workspace)
             .await
+    }
+
+    async fn chat_status(&self, chat_id: ChatId) -> ChatRuntimeStatus {
+        self.chat_status_inner(chat_id).await
     }
 }
 
@@ -442,6 +569,59 @@ mod tests {
             .expect("second cold start should succeed");
 
         assert_eq!(start_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_should_wait_for_in_flight_start_for_same_chat() {
+        let manager = Arc::new(runtime_manager());
+        let first_started = Arc::new(Notify::new());
+        let restart_entered = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+
+        let first_manager = manager.clone();
+        let first_marker = manager.clone();
+        let first_started_signal = first_started.clone();
+        let first_release = release_first.clone();
+        let first = tokio::spawn(async move {
+            first_manager
+                .ensure_unregistered_chat_runtime(ChatId(1), async move {
+                    first_started_signal.notify_one();
+                    first_release.notified().await;
+                    first_marker.registered.lock().await.insert(ChatId(1));
+                    Ok(())
+                })
+                .await
+        });
+
+        first_started.notified().await;
+
+        let restart_manager = manager.clone();
+        let restart_entered_signal = restart_entered.clone();
+        let restart = tokio::spawn(async move {
+            restart_manager
+                .restart_chat_runtime_for_test(ChatId(1), async move {
+                    restart_entered_signal.notify_one();
+                    Ok(())
+                })
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), restart_entered.notified())
+                .await
+                .is_err(),
+            "same-chat restart should wait behind the in-flight start"
+        );
+
+        release_first.notify_one();
+        first
+            .await
+            .expect("first task should join")
+            .expect("first cold start should succeed");
+        restart
+            .await
+            .expect("restart task should join")
+            .expect("restart should succeed");
     }
 
     #[tokio::test]
