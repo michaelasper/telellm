@@ -13,6 +13,8 @@ use crate::ids::ChatId;
 pub struct AppConfig {
     pub telegram: TelegramConfig,
     #[serde(default)]
+    pub telegram_ux: TelegramUxConfig,
+    #[serde(default)]
     pub prompt: PromptConfig,
     pub storage: StorageConfig,
     pub docker: DockerConfig,
@@ -28,6 +30,64 @@ pub struct TelegramConfig {
     pub bot_username: String,
     #[serde(default)]
     pub allowed_chat_ids: Vec<ChatId>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramUxConfig {
+    #[serde(default = "default_true")]
+    pub typing_indicator_enabled: bool,
+    #[serde(default = "default_typing_refresh_secs")]
+    pub typing_refresh_secs: u64,
+    #[serde(default = "default_true")]
+    pub typing_for_queued_items: bool,
+    #[serde(default = "default_true")]
+    pub streaming_enabled: bool,
+    #[serde(default = "default_streaming_mode")]
+    pub streaming_mode: TelegramStreamingMode,
+    #[serde(default = "default_streaming_update_interval_millis")]
+    pub streaming_update_interval_millis: u64,
+    #[serde(default = "default_streaming_min_delta_chars")]
+    pub streaming_min_delta_chars: usize,
+    #[serde(default = "default_streaming_max_chars")]
+    pub streaming_max_chars: usize,
+    #[serde(default = "default_formatting_mode")]
+    pub formatting_mode: TelegramFormatMode,
+    #[serde(default = "default_true")]
+    pub formatting_escape: bool,
+    #[serde(default = "default_true")]
+    pub formatting_fallback_to_plain: bool,
+}
+
+impl Default for TelegramUxConfig {
+    fn default() -> Self {
+        Self {
+            typing_indicator_enabled: default_true(),
+            typing_refresh_secs: default_typing_refresh_secs(),
+            typing_for_queued_items: default_true(),
+            streaming_enabled: default_true(),
+            streaming_mode: default_streaming_mode(),
+            streaming_update_interval_millis: default_streaming_update_interval_millis(),
+            streaming_min_delta_chars: default_streaming_min_delta_chars(),
+            streaming_max_chars: default_streaming_max_chars(),
+            formatting_mode: default_formatting_mode(),
+            formatting_escape: default_true(),
+            formatting_fallback_to_plain: default_true(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramStreamingMode {
+    EditMessage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramFormatMode {
+    Plain,
+    MarkdownV2,
+    Html,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +201,7 @@ impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         require_non_empty("telegram.bot_token_env", &self.telegram.bot_token_env)?;
         require_non_empty("telegram.bot_username", &self.telegram.bot_username)?;
+        validate_telegram_ux_config(&self.telegram_ux)?;
         require_non_empty("prompt.system_prompt", &self.prompt.system_prompt)?;
         require_non_empty("docker.image", &self.docker.image)?;
         require_non_empty("docker.network", &self.docker.network)?;
@@ -262,6 +323,30 @@ fn validate_broker_config(broker: &BrokerConfig) -> Result<(), ConfigError> {
     require_non_empty("broker.upstream_api_key_env", &broker.upstream_api_key_env)
 }
 
+fn validate_telegram_ux_config(telegram_ux: &TelegramUxConfig) -> Result<(), ConfigError> {
+    require_positive_u64(
+        "telegram_ux.typing_refresh_secs",
+        telegram_ux.typing_refresh_secs,
+    )?;
+    require_positive_u64(
+        "telegram_ux.streaming_update_interval_millis",
+        telegram_ux.streaming_update_interval_millis,
+    )?;
+    if telegram_ux.streaming_min_delta_chars == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "telegram_ux.streaming_min_delta_chars",
+            reason: "must be greater than zero",
+        });
+    }
+    if telegram_ux.streaming_max_chars < 256 {
+        return Err(ConfigError::InvalidValue {
+            field: "telegram_ux.streaming_max_chars",
+            reason: "must be at least 256",
+        });
+    }
+    Ok(())
+}
+
 fn path_is_empty_or_whitespace(path: &Path) -> bool {
     path.as_os_str().is_empty() || path.to_string_lossy().trim().is_empty()
 }
@@ -368,6 +453,34 @@ fn default_broker_rate_limit_window_secs() -> u64 {
 
 fn default_broker_max_concurrent_requests() -> usize {
     4
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_typing_refresh_secs() -> u64 {
+    4
+}
+
+fn default_streaming_mode() -> TelegramStreamingMode {
+    TelegramStreamingMode::EditMessage
+}
+
+fn default_streaming_update_interval_millis() -> u64 {
+    1_500
+}
+
+fn default_streaming_min_delta_chars() -> usize {
+    80
+}
+
+fn default_streaming_max_chars() -> usize {
+    3_900
+}
+
+fn default_formatting_mode() -> TelegramFormatMode {
+    TelegramFormatMode::Plain
 }
 
 #[cfg(test)]
@@ -479,6 +592,91 @@ mod tests {
         let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
 
         assert_eq!(config.limits.per_group_queue_depth, 16);
+    }
+
+    #[test]
+    fn from_toml_str_should_apply_default_telegram_ux() {
+        let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
+
+        assert!(config.telegram_ux.typing_indicator_enabled);
+        assert_eq!(config.telegram_ux.typing_refresh_secs, 4);
+        assert!(config.telegram_ux.streaming_enabled);
+        assert_eq!(
+            config.telegram_ux.streaming_mode,
+            TelegramStreamingMode::EditMessage
+        );
+        assert_eq!(
+            config.telegram_ux.formatting_mode,
+            TelegramFormatMode::Plain
+        );
+        assert!(config.telegram_ux.formatting_escape);
+        assert!(config.telegram_ux.formatting_fallback_to_plain);
+    }
+
+    #[test]
+    fn from_toml_str_should_parse_configured_telegram_ux() {
+        let raw = valid_config().replace(
+            "[storage]",
+            r#"[telegram_ux]
+typing_indicator_enabled = false
+typing_refresh_secs = 3
+typing_for_queued_items = false
+streaming_enabled = true
+streaming_mode = "edit_message"
+streaming_update_interval_millis = 750
+streaming_min_delta_chars = 24
+streaming_max_chars = 1200
+formatting_mode = "markdown_v2"
+formatting_escape = false
+formatting_fallback_to_plain = false
+
+[storage]"#,
+        );
+
+        let config = AppConfig::from_toml_str(&raw).expect("config should parse");
+
+        assert!(!config.telegram_ux.typing_indicator_enabled);
+        assert_eq!(config.telegram_ux.typing_refresh_secs, 3);
+        assert!(!config.telegram_ux.typing_for_queued_items);
+        assert_eq!(config.telegram_ux.streaming_update_interval_millis, 750);
+        assert_eq!(config.telegram_ux.streaming_min_delta_chars, 24);
+        assert_eq!(config.telegram_ux.streaming_max_chars, 1200);
+        assert_eq!(
+            config.telegram_ux.formatting_mode,
+            TelegramFormatMode::MarkdownV2
+        );
+        assert!(!config.telegram_ux.formatting_escape);
+        assert!(!config.telegram_ux.formatting_fallback_to_plain);
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_zero_typing_refresh_secs() {
+        let raw = format!(
+            "{}\n[telegram_ux]\ntyping_refresh_secs = 0\n",
+            valid_config()
+        );
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `telegram_ux.typing_refresh_secs` is invalid: must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_tiny_streaming_max_chars() {
+        let raw = format!(
+            "{}\n[telegram_ux]\nstreaming_max_chars = 32\n",
+            valid_config()
+        );
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `telegram_ux.streaming_max_chars` is invalid: must be at least 256"
+        );
     }
 
     #[test]

@@ -46,6 +46,8 @@ Set `telegram.allowed_chat_ids` before putting the bot in real groups. An empty 
 ## What It Does
 
 - Routes Telegram mentions, replies, slash commands, and DMs into Codex.
+- Shows Telegram typing indicators and streams partial Codex output by editing a bot-owned message.
+- Supports configurable Telegram response formatting with plain text, MarkdownV2, or HTML.
 - Keeps one persistent Docker workspace volume per Telegram chat.
 - Stores durable group memory in SQLite and rolling recent context in memory.
 - Lets groups manage their own runtime with `/status`, `/reset`, `/restart`, and `/rebuild`.

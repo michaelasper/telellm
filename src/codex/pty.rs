@@ -1,4 +1,6 @@
-use super::session::{CodexRequest, CodexSession, CodexSessionError, CodexTurn};
+use super::session::{
+    CodexEventSender, CodexRequest, CodexSession, CodexSessionError, CodexTurn, CodexTurnEvent,
+};
 use async_trait::async_trait;
 use portable_pty::{Child, CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::{
@@ -97,6 +99,14 @@ impl PtyCodexSession {
 #[async_trait]
 impl CodexSession for PtyCodexSession {
     async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
+        self.send_with_events(request, None).await
+    }
+
+    async fn send_with_events(
+        &self,
+        request: CodexRequest,
+        events: Option<CodexEventSender>,
+    ) -> Result<CodexTurn, CodexSessionError> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
             let mut guard = inner
@@ -117,7 +127,7 @@ impl CodexSession for PtyCodexSession {
             })?;
 
             Ok(CodexTurn {
-                output: guard.read_turn_output(&request.prompt)?,
+                output: guard.read_turn_output(&request.prompt, events.as_ref())?,
             })
         })
         .await
@@ -136,7 +146,11 @@ impl PtyInner {
         while self.output_rx.try_recv().is_ok() {}
     }
 
-    fn read_turn_output(&mut self, prompt: &str) -> Result<String, CodexSessionError> {
+    fn read_turn_output(
+        &mut self,
+        prompt: &str,
+        events: Option<&CodexEventSender>,
+    ) -> Result<String, CodexSessionError> {
         let deadline = Instant::now() + self.read_policy.max_turn_timeout;
         let mut output = Vec::new();
 
@@ -164,6 +178,7 @@ impl PtyInner {
                             self.read_policy.max_output_bytes
                         )));
                     }
+                    emit_clean_snapshot(prompt, &output, events, false);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) if output.is_empty() => {
                     return Err(CodexSessionError::Pty(
@@ -175,6 +190,7 @@ impl PtyInner {
                     if turn_output_is_incomplete(prompt, &cleaned) {
                         continue;
                     }
+                    emit_snapshot(&cleaned, events, true);
                     return Ok(cleaned);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) if output.is_empty() => {
@@ -185,10 +201,39 @@ impl PtyInner {
                     if turn_output_is_incomplete(prompt, &cleaned) {
                         return Err(CodexSessionError::Closed);
                     }
+                    emit_snapshot(&cleaned, events, true);
                     return Ok(cleaned);
                 }
             }
         }
+    }
+}
+
+fn emit_clean_snapshot(
+    prompt: &str,
+    output: &[u8],
+    events: Option<&CodexEventSender>,
+    is_final: bool,
+) {
+    let cleaned = clean_pty_output(prompt, output);
+    if turn_output_is_incomplete(prompt, &cleaned) {
+        return;
+    }
+    emit_snapshot(&cleaned, events, is_final);
+}
+
+fn emit_snapshot(output: &str, events: Option<&CodexEventSender>, is_final: bool) {
+    let Some(events) = events else {
+        return;
+    };
+    if output.trim().is_empty() {
+        return;
+    }
+    if let Err(err) = events.try_send(CodexTurnEvent::OutputSnapshot {
+        output: output.to_owned(),
+        is_final,
+    }) {
+        tracing::debug!(error = %err, "dropped Codex PTY snapshot");
     }
 }
 

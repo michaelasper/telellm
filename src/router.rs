@@ -1,7 +1,8 @@
 use crate::{
-    bot::telegram::{TelegramError, TelegramSink},
-    codex::session::{CodexRequest, CodexSession, CodexSessionError},
-    ids::ChatId,
+    bot::telegram::{TelegramError, TelegramMessageHandle, TelegramSendOptions, TelegramSink},
+    codex::session::{CodexRequest, CodexSession, CodexSessionError, CodexTurn, CodexTurnEvent},
+    config::{TelegramStreamingMode, TelegramUxConfig},
+    ids::{ChatId, MessageId},
 };
 use std::{
     collections::HashMap,
@@ -9,8 +10,9 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 #[derive(Debug, Clone)]
 pub struct GroupWorkItem {
@@ -33,6 +35,7 @@ where
     sessions: Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
     senders: Arc<Mutex<HashMap<ChatId, WorkerSender>>>,
     telegram: Arc<T>,
+    telegram_ux: TelegramUxConfig,
 }
 
 struct RegisteredSession<S> {
@@ -52,8 +55,23 @@ impl<S> Clone for RegisteredSession<S> {
 #[derive(Clone)]
 struct WorkerSender {
     generation: u64,
-    sender: mpsc::Sender<GroupWorkItem>,
+    sender: mpsc::Sender<QueuedWorkItem>,
     state: Arc<WorkerState>,
+}
+
+struct QueuedWorkItem {
+    item: GroupWorkItem,
+    queued_typing: Option<TypingHandle>,
+}
+
+struct TypingHandle {
+    stop: oneshot::Sender<()>,
+}
+
+impl TypingHandle {
+    fn stop(self) {
+        let _ = self.stop.send(());
+    }
 }
 
 #[derive(Default)]
@@ -84,11 +102,20 @@ where
     T: TelegramSink + 'static,
 {
     pub fn new(queue_depth: usize, telegram: Arc<T>) -> Self {
+        Self::new_with_telegram_ux(queue_depth, telegram, TelegramUxConfig::default())
+    }
+
+    pub fn new_with_telegram_ux(
+        queue_depth: usize,
+        telegram: Arc<T>,
+        telegram_ux: TelegramUxConfig,
+    ) -> Self {
         Self {
             queue_depth: queue_depth.max(1),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             senders: Arc::new(Mutex::new(HashMap::new())),
             telegram,
+            telegram_ux,
         }
     }
 
@@ -116,9 +143,22 @@ where
         let chat_id = item.chat_id;
         let sender = self.sender_for_chat(item.chat_id).await?;
         let queue_position = sender.queue_position(self.queue_depth);
+        let queued_typing = (self.telegram_ux.typing_indicator_enabled
+            && self.telegram_ux.typing_for_queued_items
+            && queue_position > 0)
+            .then(|| {
+                Self::spawn_typing_loop(
+                    self.telegram.clone(),
+                    chat_id,
+                    Duration::from_secs(self.telegram_ux.typing_refresh_secs),
+                )
+            });
         sender
             .sender
-            .send(item)
+            .send(QueuedWorkItem {
+                item,
+                queued_typing,
+            })
             .await
             .map_err(|_| RouterError::QueueClosed)?;
 
@@ -146,6 +186,7 @@ where
         }
 
         let telegram = self.telegram.clone();
+        let telegram_ux = self.telegram_ux.clone();
         let (tx, rx) = mpsc::channel(self.queue_depth);
         let state = Arc::new(WorkerState::default());
         Self::spawn_chat_worker(
@@ -153,6 +194,7 @@ where
             registered.generation,
             self.sessions.clone(),
             telegram,
+            telegram_ux,
             state.clone(),
             rx,
         );
@@ -171,18 +213,42 @@ where
         generation: u64,
         sessions: Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
         telegram: Arc<T>,
+        telegram_ux: TelegramUxConfig,
         state: Arc<WorkerState>,
-        mut rx: mpsc::Receiver<GroupWorkItem>,
+        mut rx: mpsc::Receiver<QueuedWorkItem>,
     ) {
         tokio::spawn(async move {
-            while let Some(item) = rx.recv().await {
+            while let Some(queued_item) = rx.recv().await {
+                if let Some(typing) = queued_item.queued_typing {
+                    typing.stop();
+                }
+                let item = queued_item.item;
                 let GroupWorkItem { chat_id, prompt } = item;
                 if Self::worker_is_stale(&sessions, chat_id, generation).await {
                     break;
                 }
 
                 state.begin_item();
-                let result = session.send(CodexRequest { prompt }).await;
+                let active_typing = telegram_ux.typing_indicator_enabled.then(|| {
+                    Self::spawn_typing_loop(
+                        telegram.clone(),
+                        chat_id,
+                        Duration::from_secs(telegram_ux.typing_refresh_secs),
+                    )
+                });
+                let (result, streamed_message) = Self::run_session_with_streaming(
+                    session.clone(),
+                    telegram.clone(),
+                    chat_id,
+                    prompt,
+                    telegram_ux.clone(),
+                    sessions.clone(),
+                    generation,
+                )
+                .await;
+                if let Some(typing) = active_typing {
+                    typing.stop();
+                }
 
                 if Self::worker_is_stale(&sessions, chat_id, generation).await {
                     state.finish_item();
@@ -191,7 +257,26 @@ where
 
                 match result {
                     Ok(turn) => {
-                        if let Err(err) = telegram.send_message(chat_id, &turn.output).await {
+                        let send_result = if let Some(message_id) = streamed_message {
+                            telegram
+                                .finish_streamed_message(
+                                    chat_id,
+                                    message_id,
+                                    &turn.output,
+                                    telegram_send_options(&telegram_ux),
+                                )
+                                .await
+                        } else {
+                            telegram
+                                .send_message_with_options(
+                                    chat_id,
+                                    &turn.output,
+                                    telegram_send_options(&telegram_ux),
+                                )
+                                .await
+                                .map(|_| ())
+                        };
+                        if let Err(err) = send_result {
                             tracing::warn!(
                                 error = %err,
                                 chat_id = ?chat_id,
@@ -215,6 +300,84 @@ where
         });
     }
 
+    async fn run_session_with_streaming(
+        session: Arc<S>,
+        telegram: Arc<T>,
+        chat_id: ChatId,
+        prompt: String,
+        telegram_ux: TelegramUxConfig,
+        sessions: Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
+        generation: u64,
+    ) -> (Result<CodexTurn, CodexSessionError>, Option<MessageId>) {
+        if !telegram_ux.streaming_enabled {
+            let result = session.send(CodexRequest { prompt }).await;
+            return (result, None);
+        }
+
+        match telegram_ux.streaming_mode {
+            TelegramStreamingMode::EditMessage => {}
+        }
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let request = CodexRequest { prompt };
+        let mut session_task =
+            tokio::spawn(async move { session.send_with_events(request, Some(event_tx)).await });
+        let mut stream = StreamingState::new(&telegram_ux);
+        let mut events_closed = false;
+
+        loop {
+            tokio::select! {
+                event = event_rx.recv(), if !events_closed => {
+                    match event {
+                        Some(CodexTurnEvent::OutputSnapshot { output, is_final }) => {
+                            if !is_final
+                                && !Self::worker_is_stale(&sessions, chat_id, generation).await
+                            {
+                                stream.update(&telegram, chat_id, &output).await;
+                            }
+                        }
+                        None => {
+                            events_closed = true;
+                        }
+                    }
+                }
+                result = &mut session_task => {
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(err) => Err(CodexSessionError::Process(err.to_string())),
+                    };
+                    return (result, stream.message_id());
+                }
+            }
+        }
+    }
+
+    fn spawn_typing_loop(telegram: Arc<T>, chat_id: ChatId, refresh: Duration) -> TypingHandle {
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                match stop_rx.try_recv() {
+                    Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
+                    Err(oneshot::error::TryRecvError::Empty) => {}
+                }
+
+                if let Err(err) = telegram.send_typing_action(chat_id).await {
+                    tracing::debug!(
+                        error = %err,
+                        chat_id = ?chat_id,
+                        "failed to send Telegram typing action"
+                    );
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(refresh) => {}
+                    _ = &mut stop_rx => break,
+                }
+            }
+        });
+        TypingHandle { stop: stop_tx }
+    }
+
     async fn worker_is_stale(
         sessions: &Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
         chat_id: ChatId,
@@ -226,6 +389,121 @@ where
             .get(&chat_id)
             .is_none_or(|session| session.generation != generation)
     }
+}
+
+struct StreamingState {
+    message_id: Option<MessageId>,
+    last_sent_at: Option<Instant>,
+    last_sent_chars: usize,
+    update_interval: Duration,
+    min_delta_chars: usize,
+    max_chars: usize,
+    options: TelegramSendOptions,
+}
+
+impl StreamingState {
+    fn new(telegram_ux: &TelegramUxConfig) -> Self {
+        Self {
+            message_id: None,
+            last_sent_at: None,
+            last_sent_chars: 0,
+            update_interval: Duration::from_millis(telegram_ux.streaming_update_interval_millis),
+            min_delta_chars: telegram_ux.streaming_min_delta_chars,
+            max_chars: telegram_ux.streaming_max_chars,
+            options: telegram_send_options(telegram_ux),
+        }
+    }
+
+    fn message_id(&self) -> Option<MessageId> {
+        self.message_id
+    }
+
+    async fn update<T>(&mut self, telegram: &Arc<T>, chat_id: ChatId, output: &str)
+    where
+        T: TelegramSink + 'static,
+    {
+        let preview = streaming_preview(output, self.max_chars);
+        if !self.should_update(&preview) {
+            return;
+        }
+
+        let result = if let Some(message_id) = self.message_id {
+            telegram
+                .edit_message_with_options(chat_id, message_id, &preview, self.options)
+                .await
+                .map(|_| None)
+        } else {
+            telegram
+                .send_message_with_options(chat_id, &preview, self.options)
+                .await
+                .map(first_message_id)
+        };
+
+        match result {
+            Ok(Some(message_id)) => {
+                self.message_id = Some(message_id);
+                self.record_update(&preview);
+            }
+            Ok(None) => {
+                self.record_update(&preview);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    chat_id = ?chat_id,
+                    "failed to stream Telegram Codex snapshot"
+                );
+            }
+        }
+    }
+
+    fn should_update(&self, preview: &str) -> bool {
+        if preview.trim().is_empty() {
+            return false;
+        }
+
+        let chars = preview.chars().count();
+        if self.message_id.is_none() {
+            return chars >= self.min_delta_chars;
+        }
+
+        if chars.saturating_sub(self.last_sent_chars) < self.min_delta_chars {
+            return false;
+        }
+
+        self.last_sent_at
+            .is_none_or(|sent_at| sent_at.elapsed() >= self.update_interval)
+    }
+
+    fn record_update(&mut self, preview: &str) {
+        self.last_sent_at = Some(Instant::now());
+        self.last_sent_chars = preview.chars().count();
+    }
+}
+
+fn first_message_id(handles: Vec<TelegramMessageHandle>) -> Option<MessageId> {
+    handles.first().map(|handle| handle.message_id)
+}
+
+fn telegram_send_options(telegram_ux: &TelegramUxConfig) -> TelegramSendOptions {
+    TelegramSendOptions {
+        formatting_mode: telegram_ux.formatting_mode,
+        formatting_escape: telegram_ux.formatting_escape,
+        formatting_fallback_to_plain: telegram_ux.formatting_fallback_to_plain,
+    }
+}
+
+fn streaming_preview(output: &str, max_chars: usize) -> String {
+    let mut preview = String::new();
+    let keep_chars = max_chars.saturating_sub(4);
+    for (index, ch) in output.chars().enumerate() {
+        if index >= keep_chars {
+            preview.push_str("\n...");
+            return preview;
+        }
+        preview.push(ch);
+    }
+    preview
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -243,9 +521,9 @@ pub enum RouterError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::session::CodexTurn;
+    use crate::codex::session::{CodexEventSender, CodexTurn};
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use tokio::{
         sync::{Mutex, mpsc},
         time::{Duration, timeout},
@@ -291,6 +569,50 @@ mod tests {
         }
     }
 
+    struct StreamingSession {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl StreamingSession {
+        fn new() -> Self {
+            Self {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CodexSession for StreamingSession {
+        async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
+            self.send_with_events(request, None).await
+        }
+
+        async fn send_with_events(
+            &self,
+            _request: CodexRequest,
+            events: Option<CodexEventSender>,
+        ) -> Result<CodexTurn, CodexSessionError> {
+            if let Some(events) = events {
+                let _ = events.try_send(CodexTurnEvent::OutputSnapshot {
+                    output: "partial answer from codex".to_owned(),
+                    is_final: false,
+                });
+            }
+            self.entered.notify_one();
+            self.release.notified().await;
+
+            Ok(CodexTurn {
+                output: "final answer from codex".to_owned(),
+            })
+        }
+
+        async fn restart(&self) -> Result<(), CodexSessionError> {
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl CodexSession for SlowSession {
         async fn send(&self, request: CodexRequest) -> Result<CodexTurn, CodexSessionError> {
@@ -328,6 +650,8 @@ mod tests {
 
     struct FakeTelegram {
         messages: mpsc::UnboundedSender<String>,
+        typing_actions: mpsc::UnboundedSender<ChatId>,
+        next_message_id: AtomicI32,
     }
 
     #[async_trait]
@@ -337,11 +661,63 @@ mod tests {
                 .send(text.to_owned())
                 .map_err(|err| TelegramError::Send(err.to_string()))
         }
+
+        async fn send_message_with_options(
+            &self,
+            chat_id: ChatId,
+            text: &str,
+            _options: TelegramSendOptions,
+        ) -> Result<Vec<TelegramMessageHandle>, TelegramError> {
+            let message_id = MessageId(self.next_message_id.fetch_add(1, Ordering::SeqCst));
+            self.messages
+                .send(text.to_owned())
+                .map_err(|err| TelegramError::Send(err.to_string()))?;
+            Ok(vec![TelegramMessageHandle {
+                chat_id,
+                message_id,
+            }])
+        }
+
+        async fn edit_message_with_options(
+            &self,
+            _chat_id: ChatId,
+            message_id: MessageId,
+            text: &str,
+            _options: TelegramSendOptions,
+        ) -> Result<(), TelegramError> {
+            self.messages
+                .send(format!("edit:{}:{text}", message_id.0))
+                .map_err(|err| TelegramError::Edit(err.to_string()))
+        }
+
+        async fn send_typing_action(&self, chat_id: ChatId) -> Result<(), TelegramError> {
+            self.typing_actions
+                .send(chat_id)
+                .map_err(|err| TelegramError::ChatAction(err.to_string()))
+        }
     }
 
     fn fake_telegram() -> (Arc<FakeTelegram>, mpsc::UnboundedReceiver<String>) {
+        let (telegram, messages, _typing_actions) = fake_telegram_with_actions();
+        (telegram, messages)
+    }
+
+    fn fake_telegram_with_actions() -> (
+        Arc<FakeTelegram>,
+        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<ChatId>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Arc::new(FakeTelegram { messages: tx }), rx)
+        let (typing_tx, typing_rx) = mpsc::unbounded_channel();
+        (
+            Arc::new(FakeTelegram {
+                messages: tx,
+                typing_actions: typing_tx,
+                next_message_id: AtomicI32::new(1),
+            }),
+            rx,
+            typing_rx,
+        )
     }
 
     async fn receive_message(rx: &mut mpsc::UnboundedReceiver<String>) -> String {
@@ -349,6 +725,13 @@ mod tests {
             .await
             .expect("telegram message should arrive before timeout")
             .expect("telegram sender should stay open")
+    }
+
+    async fn receive_typing_action(rx: &mut mpsc::UnboundedReceiver<ChatId>) -> ChatId {
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("typing action should arrive before timeout")
+            .expect("typing sender should stay open")
     }
 
     #[tokio::test]
@@ -436,6 +819,72 @@ mod tests {
             .expect("second enqueue should work");
 
         assert_eq!(receipt.queue_position, 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_should_send_typing_action_while_turn_is_active() {
+        let (telegram, _messages, mut typing_actions) = fake_telegram_with_actions();
+        let session = Arc::new(SlowSession::new("reply"));
+        let router = Router::new_with_telegram_ux(
+            4,
+            telegram,
+            TelegramUxConfig {
+                streaming_enabled: false,
+                typing_refresh_secs: 1,
+                ..TelegramUxConfig::default()
+            },
+        );
+        router.register_session(ChatId(1), 1, session.clone()).await;
+
+        let first_entered = session.entered.notified();
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "one".to_owned(),
+            })
+            .await
+            .expect("enqueue should work");
+        first_entered.await;
+
+        assert_eq!(receive_typing_action(&mut typing_actions).await, ChatId(1));
+        session.release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn enqueue_should_stream_snapshot_then_edit_final_message() {
+        let (telegram, mut messages) = fake_telegram();
+        let session = Arc::new(StreamingSession::new());
+        let router = Router::new_with_telegram_ux(
+            4,
+            telegram,
+            TelegramUxConfig {
+                typing_indicator_enabled: false,
+                streaming_min_delta_chars: 1,
+                streaming_update_interval_millis: 1,
+                ..TelegramUxConfig::default()
+            },
+        );
+        router.register_session(ChatId(1), 1, session.clone()).await;
+
+        let first_entered = session.entered.notified();
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "stream please".to_owned(),
+            })
+            .await
+            .expect("enqueue should work");
+        first_entered.await;
+
+        assert_eq!(
+            receive_message(&mut messages).await,
+            "partial answer from codex"
+        );
+        session.release.notify_one();
+        assert_eq!(
+            receive_message(&mut messages).await,
+            "edit:1:final answer from codex"
+        );
     }
 
     #[tokio::test]

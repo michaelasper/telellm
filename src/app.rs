@@ -62,9 +62,10 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         config.limits.telegram_chunk_chars,
     ));
     let allowed_chat_ids = config.telegram.allowed_chat_ids.clone();
-    let router = Arc::new(crate::router::Router::new(
+    let router = Arc::new(crate::router::Router::new_with_telegram_ux(
         config.limits.per_group_queue_depth,
         telegram_sink,
+        config.telegram_ux.clone(),
     ));
     let memory_url = format!("sqlite://{}?mode=rwc", config.storage.sqlite_path.display());
     let memory_store = Arc::new(crate::memory::SqliteMemoryStore::connect(&memory_url).await?);

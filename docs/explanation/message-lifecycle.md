@@ -61,4 +61,8 @@ The PTY supervisor does not receive structured "turn complete" events from Codex
 - Maximum output byte limit.
 - PTY closes.
 
-The cleaned output is then sent to Telegram, split into configured chunk sizes.
+While the PTY produces output, the router can stream cleaned cumulative snapshots to Telegram by editing one bot-owned message. Snapshots are throttled by `telegram_ux.streaming_update_interval_millis` and `telegram_ux.streaming_min_delta_chars`.
+
+The final cleaned output is authoritative. If a streamed preview exists, the router edits it with the first final chunk and sends any remaining chunks as follow-up messages.
+
+The router can also refresh Telegram `typing` chat actions while work is queued or running. These indicators are transient Telegram UI state; they do not create messages and they stop when the bot sends a message.

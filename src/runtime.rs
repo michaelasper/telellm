@@ -4,7 +4,7 @@ use crate::{
     codex::{
         exec::CommandCodexSession,
         pty::{PtyCodexSession, PtyReadPolicy},
-        session::{CodexRequest, CodexSession, CodexSessionError, CodexTurn},
+        session::{CodexEventSender, CodexRequest, CodexSession, CodexSessionError, CodexTurn},
     },
     config::{BrokerConfig, CodexAuthMode, CodexConfig, DockerConfig},
     ids::ChatId,
@@ -90,6 +90,17 @@ impl CodexSession for ManagedCodexSession {
         match self {
             Self::Pty(session) => session.send(request).await,
             Self::Command(session) => session.send(request).await,
+        }
+    }
+
+    async fn send_with_events(
+        &self,
+        request: CodexRequest,
+        events: Option<CodexEventSender>,
+    ) -> Result<CodexTurn, CodexSessionError> {
+        match self {
+            Self::Pty(session) => session.send_with_events(request, events).await,
+            Self::Command(session) => session.send_with_events(request, events).await,
         }
     }
 
@@ -887,6 +898,7 @@ mod tests {
                 bot_username: "telellm_bot".to_owned(),
                 allowed_chat_ids: Vec::new(),
             },
+            telegram_ux: crate::config::TelegramUxConfig::default(),
             prompt: crate::config::PromptConfig::default(),
             storage: StorageConfig {
                 sqlite_path: "data/telellm.sqlite".into(),

@@ -5,6 +5,21 @@ bot_username = "telellm_bot"
 # Empty means every chat that reaches the bot is allowed.
 allowed_chat_ids = [-1001234567890]
 
+[telegram_ux]
+typing_indicator_enabled = true
+typing_refresh_secs = 4
+typing_for_queued_items = true
+streaming_enabled = true
+streaming_mode = "edit_message"
+streaming_update_interval_millis = 1500
+streaming_min_delta_chars = 80
+streaming_max_chars = 3900
+# Use "plain" by default. "markdown_v2" and "html" are available when the
+# model output is escaped or explicitly authored for Telegram formatting.
+formatting_mode = "plain"
+formatting_escape = true
+formatting_fallback_to_plain = true
+
 [prompt]
 system_prompt = """
 You are the Telegram group assistant for this chat.

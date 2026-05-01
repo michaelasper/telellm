@@ -45,6 +45,14 @@ Queued behind N existing request(s).
 
 The queued work remains serialised through the per-group worker.
 
+If `telegram_ux.typing_indicator_enabled` and `telegram_ux.typing_for_queued_items` are enabled, queued work can also refresh Telegram's typing indicator until its turn starts.
+
+## Response Streaming And Formatting
+
+When `telegram_ux.streaming_enabled` is enabled, addressed Codex prompts can produce a bot-owned streaming message that is edited with throttled output snapshots. The final Codex answer replaces the preview before any remaining chunks are sent.
+
+Response formatting is controlled by `telegram_ux.formatting_mode`. The default `plain` mode sends text without Telegram parsing. `markdown_v2` and `html` use Telegram parse modes and can escape model output before sending when `telegram_ux.formatting_escape` is enabled.
+
 ## Command Parse Errors
 
 Unknown commands and missing command arguments are logged by the daemon. They are not currently sent back as user-visible Telegram errors.

@@ -14,6 +14,26 @@ The example config is `config.example.toml`.
 
 `bot_token_env` and `bot_username` must not be empty.
 
+## `[telegram_ux]`
+
+All fields are optional. The section controls Telegram-facing behavior for Codex turns.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `typing_indicator_enabled` | boolean | `true` | Sends Telegram `typing` chat actions while a turn is queued or running. |
+| `typing_refresh_secs` | integer | `4` | Seconds between typing-action refreshes. Telegram typing indicators are transient. |
+| `typing_for_queued_items` | boolean | `true` | Sends typing actions for queued items before their Codex turn starts. |
+| `streaming_enabled` | boolean | `true` | Sends partial Codex output as edited Telegram messages when snapshots are available. |
+| `streaming_mode` | string | `edit_message` | Streaming strategy. The current supported value is `edit_message`. |
+| `streaming_update_interval_millis` | integer | `1500` | Minimum time between Telegram message edits. |
+| `streaming_min_delta_chars` | integer | `80` | Minimum preview growth before another streaming edit is sent. |
+| `streaming_max_chars` | integer | `3900` | Maximum characters shown in a streaming preview. Final responses still use normal chunking. |
+| `formatting_mode` | string | `plain` | Response formatting mode. Valid values are `plain`, `markdown_v2`, and `html`. |
+| `formatting_escape` | boolean | `true` | Escapes model output before applying Telegram parse mode. Disable only when the model is prompted to produce valid Telegram formatting syntax. |
+| `formatting_fallback_to_plain` | boolean | `true` | Retries without parse mode when Telegram rejects formatted text. |
+
+`typing_refresh_secs`, `streaming_update_interval_millis`, and `streaming_min_delta_chars` must be greater than zero. `streaming_max_chars` must be at least `256`.
+
 ## `[prompt]`
 
 | Field | Type | Required | Default In Example | Description |
