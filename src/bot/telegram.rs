@@ -396,11 +396,12 @@ fn normalize_message(
     let text = message.text()?.to_owned();
     let from = message.from.as_ref().map(user_id);
     let from_name = message.from.as_ref().map(display_name);
-    let reply_to_bot = message
-        .reply_to_message()
+    let replied_message = message.reply_to_message();
+    let reply_to_bot = replied_message
         .and_then(|reply| reply.from.as_ref())
         .and_then(|user| user.username.as_deref())
         .is_some_and(|username| username.eq_ignore_ascii_case(bot_username));
+    let reply_to = replied_message.and_then(normalize_replied_message);
 
     Some(crate::bot::message::IncomingMessage {
         chat_id: ChatId(message.chat.id.0),
@@ -409,7 +410,16 @@ fn normalize_message(
         from_name,
         text,
         reply_to_bot,
+        reply_to,
         private_chat: message.chat.is_private(),
+    })
+}
+
+fn normalize_replied_message(message: &Message) -> Option<crate::bot::message::RepliedMessage> {
+    Some(crate::bot::message::RepliedMessage {
+        message_id: crate::ids::MessageId(message.id.0),
+        from_name: message.from.as_ref().map(display_name),
+        text: message.text()?.to_owned(),
     })
 }
 

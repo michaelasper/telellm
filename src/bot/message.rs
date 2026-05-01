@@ -8,7 +8,15 @@ pub struct IncomingMessage {
     pub from_name: Option<String>,
     pub text: String,
     pub reply_to_bot: bool,
+    pub reply_to: Option<RepliedMessage>,
     pub private_chat: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepliedMessage {
+    pub message_id: MessageId,
+    pub from_name: Option<String>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +55,7 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             reply_to_bot: false,
+            reply_to: None,
             private_chat: false,
         }
     }

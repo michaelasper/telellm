@@ -20,11 +20,14 @@ A message is addressed when it:
 - Replies to a bot message.
 - Uses a supported slash command.
 
+When Telegram includes a replied-to text message in the update, `telellm` preserves that snapshot and renders it as explicit reply context. This is especially important for replies to the bot's own messages, because the daemon may not otherwise receive its outgoing Telegram messages back through polling.
+
 For addressed non-command messages, the daemon builds a context packet:
 
 - The configured system prompt.
 - Durable group memory.
 - Recent chat from the rolling buffer.
+- The replied-to message, when Telegram provided one.
 - The triggering message.
 
 That rendered packet is sent to Codex as the prompt.

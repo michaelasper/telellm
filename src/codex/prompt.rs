@@ -35,6 +35,7 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: "@telellm_bot hello".to_owned(),
             reply_to_bot: false,
+            reply_to: None,
             private_chat: false,
         };
         let packet = ContextPacket {

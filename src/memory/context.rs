@@ -37,6 +37,11 @@ impl ContextPacket {
             }
         }
 
+        if let Some(reply_to) = &self.triggering_message.reply_to {
+            output.push_str("\nReply context:\n");
+            push_replied_message_line(&mut output, reply_to);
+        }
+
         output.push_str("\nTriggering message:\n");
         push_message_line(&mut output, &self.triggering_message);
         output
@@ -44,6 +49,15 @@ impl ContextPacket {
 }
 
 fn push_message_line(output: &mut String, message: &IncomingMessage) {
+    let name = message.from_name.as_deref().unwrap_or("unknown");
+    output.push_str("- ");
+    output.push_str(name);
+    output.push_str(": ");
+    output.push_str(&message.text);
+    output.push('\n');
+}
+
+fn push_replied_message_line(output: &mut String, message: &crate::bot::message::RepliedMessage) {
     let name = message.from_name.as_deref().unwrap_or("unknown");
     output.push_str("- ");
     output.push_str(name);
@@ -68,6 +82,7 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             reply_to_bot: false,
+            reply_to: None,
             private_chat: false,
         }
     }
@@ -103,5 +118,27 @@ mod tests {
 
         let rendered = packet.render();
         assert!(rendered.contains("No durable memory is stored for this group yet"));
+    }
+
+    #[test]
+    fn render_should_include_replied_message_context() {
+        let mut trigger = message("HUAC?");
+        trigger.reply_to_bot = true;
+        trigger.reply_to = Some(crate::bot::message::RepliedMessage {
+            message_id: MessageId(7),
+            from_name: Some("beru".to_owned()),
+            text: "Of course I know about the commune, Nick.".to_owned(),
+        });
+        let packet = ContextPacket {
+            system_prompt: "Answer the trigger.".to_owned(),
+            triggering_message: trigger,
+            recent_messages: Vec::new(),
+            memories: Vec::new(),
+        };
+
+        let rendered = packet.render();
+
+        assert!(rendered.contains("Reply context:\n- beru: Of course I know about the commune"));
+        assert!(rendered.contains("Triggering message:\n- Mike: HUAC?"));
     }
 }
