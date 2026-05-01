@@ -20,6 +20,7 @@ All fields are optional. The section controls Telegram-facing behavior for Codex
 
 | Field | Type | Default In Example | Description |
 | --- | --- | --- | --- |
+| `queue_ack_enabled` | boolean | `true` | Sends a short Telegram acknowledgement when a request is queued behind existing work. |
 | `typing_indicator_enabled` | boolean | `true` | Sends Telegram `typing` chat actions while a turn is queued or running. |
 | `typing_refresh_secs` | integer | `4` | Seconds between typing-action refreshes. Telegram typing indicators are transient. |
 | `typing_for_queued_items` | boolean | `true` | Sends typing actions for queued items before their Codex turn starts. |

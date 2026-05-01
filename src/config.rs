@@ -35,6 +35,8 @@ pub struct TelegramConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramUxConfig {
     #[serde(default = "default_true")]
+    pub queue_ack_enabled: bool,
+    #[serde(default = "default_true")]
     pub typing_indicator_enabled: bool,
     #[serde(default = "default_typing_refresh_secs")]
     pub typing_refresh_secs: u64,
@@ -61,6 +63,7 @@ pub struct TelegramUxConfig {
 impl Default for TelegramUxConfig {
     fn default() -> Self {
         Self {
+            queue_ack_enabled: default_true(),
             typing_indicator_enabled: default_true(),
             typing_refresh_secs: default_typing_refresh_secs(),
             typing_for_queued_items: default_true(),
@@ -598,6 +601,7 @@ mod tests {
     fn from_toml_str_should_apply_default_telegram_ux() {
         let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
 
+        assert!(config.telegram_ux.queue_ack_enabled);
         assert!(config.telegram_ux.typing_indicator_enabled);
         assert_eq!(config.telegram_ux.typing_refresh_secs, 4);
         assert!(config.telegram_ux.streaming_enabled);
@@ -618,6 +622,7 @@ mod tests {
         let raw = valid_config().replace(
             "[storage]",
             r#"[telegram_ux]
+queue_ack_enabled = false
 typing_indicator_enabled = false
 typing_refresh_secs = 3
 typing_for_queued_items = false
@@ -636,6 +641,7 @@ formatting_fallback_to_plain = false
         let config = AppConfig::from_toml_str(&raw).expect("config should parse");
 
         assert!(!config.telegram_ux.typing_indicator_enabled);
+        assert!(!config.telegram_ux.queue_ack_enabled);
         assert_eq!(config.telegram_ux.typing_refresh_secs, 3);
         assert!(!config.telegram_ux.typing_for_queued_items);
         assert_eq!(config.telegram_ux.streaming_update_interval_millis, 750);

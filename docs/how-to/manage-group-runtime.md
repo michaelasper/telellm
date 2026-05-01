@@ -69,7 +69,7 @@ To clear the workspace while rebuilding, send:
 
 ## Handle A Busy Group
 
-If another request is already running for the same group, `telellm` queues the new request and replies:
+If another request is already running for the same group, `telellm` queues the new request. When `telegram_ux.queue_ack_enabled` is enabled, it replies:
 
 ```text
 Queued behind N existing request(s).

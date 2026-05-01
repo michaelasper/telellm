@@ -6,6 +6,7 @@ bot_username = "telellm_bot"
 allowed_chat_ids = [-1001234567890]
 
 [telegram_ux]
+queue_ack_enabled = true
 typing_indicator_enabled = true
 typing_refresh_secs = 4
 typing_for_queued_items = true

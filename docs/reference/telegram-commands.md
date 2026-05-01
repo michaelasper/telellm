@@ -37,7 +37,7 @@ Commands are group-scoped. A command addressed to another bot, such as `/status@
 
 ## Queue Acknowledgement
 
-When a group already has active or buffered work, the bot replies:
+When a group already has active or buffered work, and `telegram_ux.queue_ack_enabled` is enabled, the bot replies:
 
 ```text
 Queued behind N existing request(s).

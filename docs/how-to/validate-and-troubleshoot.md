@@ -100,7 +100,7 @@ Increase these limits if valid turns are timing out or being capped.
 
 ## Tune Telegram UX
 
-Typing indicators and response streaming are controlled by `[telegram_ux]`.
+Queue acknowledgements, typing indicators, response streaming, and Telegram formatting are controlled by `[telegram_ux]`.
 
 If Telegram edit rate limits appear in logs, increase `streaming_update_interval_millis` or `streaming_min_delta_chars`. If partial updates are too long, lower `streaming_max_chars`; the final response still uses normal chunking.
 

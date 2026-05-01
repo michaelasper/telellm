@@ -77,10 +77,14 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         router.clone(),
         crate::config::codex_read_policy(&config),
     ));
-    let app_core = Arc::new(AppCore::new(
-        config.telegram.bot_username.clone(),
-        config.prompt.system_prompt.clone(),
+    let app_core_config = AppCoreConfig {
+        bot_username: config.telegram.bot_username.clone(),
+        system_prompt: config.prompt.system_prompt.clone(),
         allowed_chat_ids,
+        queue_ack_enabled: config.telegram_ux.queue_ack_enabled,
+    };
+    let app_core = Arc::new(AppCore::new(
+        app_core_config,
         memory_store,
         RollingBuffer::new(config.limits.recent_buffer_messages),
         router,
@@ -101,10 +105,19 @@ where
     bot_username: String,
     system_prompt: String,
     allowed_chat_ids: Vec<crate::ids::ChatId>,
+    queue_ack_enabled: bool,
     memory_store: Arc<M>,
     rolling: Arc<Mutex<RollingBuffer>>,
     router: Arc<Router<S, T>>,
     runtime: Arc<N>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppCoreConfig {
+    pub bot_username: String,
+    pub system_prompt: String,
+    pub allowed_chat_ids: Vec<crate::ids::ChatId>,
+    pub queue_ack_enabled: bool,
 }
 
 impl<M, S, T, N> AppCore<M, S, T, N>
@@ -115,18 +128,24 @@ where
     N: RuntimeControl + 'static,
 {
     pub fn new(
-        bot_username: String,
-        system_prompt: String,
-        allowed_chat_ids: Vec<crate::ids::ChatId>,
+        config: AppCoreConfig,
         memory_store: Arc<M>,
         rolling: RollingBuffer,
         router: Arc<Router<S, T>>,
         runtime: Arc<N>,
     ) -> Self {
+        let AppCoreConfig {
+            bot_username,
+            system_prompt,
+            allowed_chat_ids,
+            queue_ack_enabled,
+        } = config;
+
         Self {
             bot_username,
             system_prompt,
             allowed_chat_ids,
+            queue_ack_enabled,
             memory_store,
             rolling: Arc::new(Mutex::new(rolling)),
             router,
@@ -267,7 +286,7 @@ where
                 prompt: prompt.into(),
             })
             .await?;
-        if receipt.queue_position > 0 {
+        if self.queue_ack_enabled && receipt.queue_position > 0 {
             self.reply_text(
                 chat_id,
                 format!(
@@ -390,6 +409,15 @@ mod tests {
 
     fn test_system_prompt() -> String {
         "Test system prompt.".to_owned()
+    }
+
+    fn app_core_config(allowed_chat_ids: Vec<ChatId>, queue_ack_enabled: bool) -> AppCoreConfig {
+        AppCoreConfig {
+            bot_username: "telellm_bot".to_owned(),
+            system_prompt: test_system_prompt(),
+            allowed_chat_ids,
+            queue_ack_enabled,
+        }
     }
 
     #[tokio::test]
@@ -525,9 +553,7 @@ mod tests {
         router.register_session(ChatId(1), 1, codex.clone()).await;
         let runtime = Arc::new(FakeRuntime::default());
         let app = AppCore::new(
-            "telellm_bot".to_owned(),
-            test_system_prompt(),
-            Vec::new(),
+            app_core_config(Vec::new(), true),
             memory,
             RollingBuffer::new(10),
             router,
@@ -551,6 +577,41 @@ mod tests {
             .expect("telegram sender should stay open");
 
         assert_eq!(ack, "Queued behind 1 existing request(s).");
+    }
+
+    #[tokio::test]
+    async fn addressed_message_should_skip_queue_acknowledgement_when_disabled() {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, mut messages) = FakeTelegram::new();
+        let router = Arc::new(Router::new(4, telegram));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let codex = Arc::new(BlockingCodexSession::new(entered_tx));
+        router.register_session(ChatId(1), 1, codex.clone()).await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let app = AppCore::new(
+            app_core_config(Vec::new(), false),
+            memory,
+            RollingBuffer::new(10),
+            router,
+            runtime,
+        );
+
+        app.handle_message(incoming("@telellm_bot first"))
+            .await
+            .expect("first addressed message should be handled");
+        timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("first Codex turn should start")
+            .expect("blocking session should report the first prompt");
+
+        app.handle_message(incoming("@telellm_bot second"))
+            .await
+            .expect("second addressed message should be handled");
+
+        assert!(matches!(
+            messages.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -590,9 +651,7 @@ mod tests {
         router.register_session(ChatId(1), 1, codex.clone()).await;
         let runtime = Arc::new(FakeRuntime::default());
         let app = AppCore::new(
-            "telellm_bot".to_owned(),
-            test_system_prompt(),
-            Vec::new(),
+            app_core_config(Vec::new(), true),
             memory,
             RollingBuffer::new(10),
             router,
@@ -616,9 +675,7 @@ mod tests {
             .await;
         let runtime = Arc::new(FakeRuntime::default());
         let app = AppCore::new(
-            "telellm_bot".to_owned(),
-            test_system_prompt(),
-            allowed_chat_ids,
+            app_core_config(allowed_chat_ids, true),
             memory,
             RollingBuffer::new(10),
             router,
