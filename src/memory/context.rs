@@ -3,6 +3,7 @@ use crate::bot::message::IncomingMessage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPacket {
+    pub system_prompt: String,
     pub triggering_message: IncomingMessage,
     pub recent_messages: Vec<IncomingMessage>,
     pub memories: Vec<MemoryRecord>,
@@ -11,10 +12,8 @@ pub struct ContextPacket {
 impl ContextPacket {
     pub fn render(&self) -> String {
         let mut output = String::new();
-        output.push_str("You are the Telegram group assistant for this chat.\n");
-        output.push_str(
-            "Respond only to the triggering message. Use recent chat and memory as context.\n\n",
-        );
+        output.push_str(self.system_prompt.trim());
+        output.push_str("\n\n");
 
         output.push_str("Long-term memory:\n");
         if self.memories.is_empty() {
@@ -69,12 +68,14 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             reply_to_bot: false,
+            private_chat: false,
         }
     }
 
     #[test]
     fn render_should_include_memory_recent_chat_and_trigger() {
         let packet = ContextPacket {
+            system_prompt: "Use memory well.".to_owned(),
             triggering_message: message("@telellm_bot summarize that"),
             recent_messages: vec![message("we were talking about the deploy")],
             memories: vec![MemoryRecord {
@@ -87,12 +88,14 @@ mod tests {
         };
 
         let rendered = packet.render();
+        assert!(rendered.starts_with("Use memory well."));
         assert!(rendered.contains("Mike likes concise updates"));
     }
 
     #[test]
     fn render_should_show_empty_memory_and_recent_chat_placeholders() {
         let packet = ContextPacket {
+            system_prompt: "Answer the trigger.".to_owned(),
             triggering_message: message("@telellm_bot hello"),
             recent_messages: Vec::new(),
             memories: Vec::new(),

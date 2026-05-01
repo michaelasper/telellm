@@ -1,0 +1,103 @@
+# Configuration Reference
+
+`telellm` loads TOML into `AppConfig`.
+
+The example config is `config.example.toml`.
+
+## `[telegram]`
+
+| Field | Type | Required | Default In Example | Description |
+| --- | --- | --- | --- | --- |
+| `bot_token_env` | string | yes | `TELEGRAM_BOT_TOKEN` | Environment variable containing the Telegram bot token. |
+| `bot_username` | string | yes | `telellm_bot` | Bot username used for mentions and addressed commands. |
+| `allowed_chat_ids` | array of integers | no | `[]` | Chat allow-list. Empty means all chats are allowed. |
+
+`bot_token_env` and `bot_username` must not be empty.
+
+## `[prompt]`
+
+| Field | Type | Required | Default In Example | Description |
+| --- | --- | --- | --- | --- |
+| `system_prompt` | string | no | built-in Telegram assistant prompt | Instruction text rendered at the top of every Codex turn before long-term memory, recent chat, and the triggering message. |
+
+`system_prompt` must not be empty after trimming whitespace. If `[prompt]` is omitted, the daemon uses the built-in Telegram group assistant prompt.
+
+## `[storage]`
+
+| Field | Type | Required | Default In Example | Description |
+| --- | --- | --- | --- | --- |
+| `sqlite_path` | path | yes | `data/telellm.sqlite` | Local SQLite database path for durable memory. |
+
+The daemon creates the parent directory before connecting to SQLite.
+
+## `[docker]`
+
+| Field | Type | Required | Default In Example | Description |
+| --- | --- | --- | --- | --- |
+| `image` | string | yes | `telellm-sandbox:local` | Docker image used for group sandboxes. |
+| `network` | string | yes | `telellm_public` | Docker network attached to group sandboxes. |
+| `workspace_volume_prefix` | string | yes | `telellm_workspace` | Prefix for per-group named workspace volumes. |
+
+All three fields must not be empty.
+
+## `[codex]`
+
+| Field | Type | Required | Default In Example | Description |
+| --- | --- | --- | --- | --- |
+| `command` | string | yes | `codex` | Command executed inside the sandbox container. |
+| `args` | array of strings | no | `["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]` | Extra arguments placed before `--model` and `--cd`. When the first argument is `exec`, the runtime uses non-interactive `codex exec` and returns only the final message. |
+| `model` | string | yes | `gpt-5.5` | Model passed to Codex with `--model`. In `chatgpt_oauth` mode, use a model available to the ChatGPT account. |
+| `auth_mode` | string | no | `broker_api_key` | Codex credential strategy. Valid values are `broker_api_key` and `chatgpt_oauth`. |
+| `auth_host_path` | path | when `auth_mode = "chatgpt_oauth"` | unset | Absolute host path to Codex CLI `auth.json`. |
+| `env` | map of strings | no | `{}` | Parsed by config. It is not currently applied by the runtime. |
+
+`command` and `model` must not be empty.
+
+When `auth_mode` is `broker_api_key`, `[broker]` is required. When it is `chatgpt_oauth`, `auth_host_path` is required and must not be empty.
+
+The runtime appends:
+
+```text
+--model <model> --cd /workspace
+```
+
+## `[broker]`
+
+Required only when `codex.auth_mode` is `broker_api_key`.
+
+| Field | Type | Required | Default In Example | Description |
+| --- | --- | --- | --- | --- |
+| `listen` | socket address | yes | `127.0.0.1:8189` | Host address where the broker listens. |
+| `public_base_url` | URL string | yes | `http://host.docker.internal:8189/v1` | Base URL passed into sandboxes as `OPENAI_BASE_URL`. |
+| `upstream_base_url` | URL string | yes | `https://api.openai.com/v1` | Upstream API base URL used by the host broker. |
+| `upstream_api_key_env` | string | yes | `OPENAI_API_KEY` | Environment variable containing the upstream API key. |
+
+`public_base_url`, `upstream_base_url`, and `upstream_api_key_env` must not be empty.
+
+## `[limits]`
+
+All limits are optional.
+
+| Field | Default | Validation | Description |
+| --- | ---: | --- | --- |
+| `per_group_queue_depth` | `16` | greater than `0` | Bounded queue depth for each group's work queue. |
+| `telegram_chunk_chars` | `3900` | at least `256` | Maximum byte length sent per Telegram message chunk. |
+| `recent_buffer_messages` | `200` | coerced to at least `1` by the rolling buffer | In-memory recent messages retained per chat. |
+| `codex_first_byte_timeout_secs` | `300` | greater than `0` | Maximum wait for the first PTY output byte. |
+| `codex_inactivity_secs` | `600` | greater than `0` | Idle period after output before a turn is considered complete. |
+| `codex_max_turn_secs` | `900` | greater than `0` | Maximum total PTY turn duration. |
+| `codex_max_output_bytes` | `524288` | greater than `0` | Maximum PTY output bytes per turn. |
+| `broker_max_requests_per_window` | `120` | greater than `0` | Per-token broker request count limit. |
+| `broker_rate_limit_window_secs` | `60` | greater than `0` | Per-token broker request window. |
+| `broker_max_concurrent_requests` | `4` | greater than `0` | Per-token concurrent broker request limit. |
+
+## Required Environment Variables
+
+The names are configurable.
+
+| Default Name | Used By | Description |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Telegram adapter | Bot token from BotFather. |
+| `OPENAI_API_KEY` | Host broker, only in `broker_api_key` mode | Upstream provider credential. This is not passed directly into the sandbox. |
+
+In `chatgpt_oauth` mode, Codex uses the host auth file named by `codex.auth_host_path`; no upstream API key environment variable is required.

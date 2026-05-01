@@ -6,6 +6,7 @@ use crate::{
     ids::{ChatId, SandboxId},
 };
 use async_trait::async_trait;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxSpec {
@@ -18,6 +19,7 @@ pub struct SandboxSpec {
     pub broker_port: u16,
     pub broker_base_url: String,
     pub broker_token: BrokerToken,
+    pub codex_auth_host_path: Option<PathBuf>,
 }
 
 impl SandboxSpec {
@@ -33,6 +35,7 @@ impl SandboxSpec {
             broker_port: 8189,
             broker_base_url: "http://host.docker.internal:8189/v1".to_owned(),
             broker_token: BrokerToken::generate(),
+            codex_auth_host_path: None,
         }
     }
 }
@@ -50,6 +53,8 @@ pub enum SandboxError {
     Docker(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Codex auth host path `{}` is invalid: {reason}", path.display())]
+    InvalidCodexAuthPath { path: PathBuf, reason: String },
 }
 
 #[cfg(test)]

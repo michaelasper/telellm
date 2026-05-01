@@ -8,6 +8,7 @@ pub struct IncomingMessage {
     pub from_name: Option<String>,
     pub text: String,
     pub reply_to_bot: bool,
+    pub private_chat: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +19,7 @@ pub enum Addressing {
 
 impl IncomingMessage {
     pub fn addressing(&self, bot_username: &str) -> Addressing {
-        if self.reply_to_bot || mentions_bot(&self.text, bot_username) {
+        if self.private_chat || self.reply_to_bot || mentions_bot(&self.text, bot_username) {
             Addressing::Addressed
         } else {
             Addressing::Ambient
@@ -44,6 +45,7 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             reply_to_bot: false,
+            private_chat: false,
         }
     }
 
@@ -65,6 +67,14 @@ mod tests {
     fn addressing_should_treat_reply_to_bot_as_addressed() {
         let mut msg = message("continue");
         msg.reply_to_bot = true;
+
+        assert_eq!(msg.addressing("telellm_bot"), Addressing::Addressed);
+    }
+
+    #[test]
+    fn addressing_should_treat_private_chat_as_addressed() {
+        let mut msg = message("plain DM text");
+        msg.private_chat = true;
 
         assert_eq!(msg.addressing("telellm_bot"), Addressing::Addressed);
     }

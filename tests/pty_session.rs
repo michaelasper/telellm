@@ -33,6 +33,25 @@ async fn pty_session_should_read_until_output_is_idle() {
 }
 
 #[tokio::test]
+async fn pty_session_should_wait_past_prompt_echo_before_returning() {
+    let args = vec![
+        "-lc".to_owned(),
+        "while IFS= read -r line; do sleep 0.3; printf 'answer:%s\\n' \"$line\"; done".to_owned(),
+    ];
+    let session = PtyCodexSession::spawn_with_read_policy("sh", &args, fast_read_policy())
+        .expect("shell session should spawn");
+
+    let turn = session
+        .send(CodexRequest {
+            prompt: "delayed answer".to_owned(),
+        })
+        .await
+        .expect("send should wait for delayed answer");
+
+    assert_eq!(turn.output, "answer:delayed answer");
+}
+
+#[tokio::test]
 async fn pty_session_should_collect_more_than_one_read_buffer() {
     let args = vec![
         "-lc".to_owned(),

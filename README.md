@@ -2,52 +2,55 @@
 
 `telellm` bridges Telegram group chats to sandboxed Codex CLI sessions.
 
-## Local Setup
+## Documentation
 
-1. Copy `config.example.toml` to `config.toml`.
-2. Set `TELEGRAM_BOT_TOKEN`.
-3. Set `OPENAI_API_KEY` for the host broker.
-4. Create the bot in BotFather and add it to a test group.
+Start with the documentation map:
 
-If you want ambient catch-up messages to reach the daemon, disable Telegram group privacy for the bot in BotFather. Set `allowed_chat_ids` in `config.toml` before adding the bot to broader groups; use Telegram `getUpdates` or daemon logs to discover the numeric group chat ID.
+- [Documentation index](docs/README.md)
 
-5. Create the Docker network referenced by `config.example.toml`:
+The main paths are:
 
-```bash
-docker network create telellm_public
-```
+- [Run telellm locally for the first time](docs/tutorials/first-run.md)
+- [How to validate and troubleshoot a setup](docs/how-to/validate-and-troubleshoot.md)
+- [Configuration reference](docs/reference/configuration.md)
+- [Telegram command reference](docs/reference/telegram-commands.md)
+- [Architecture](docs/explanation/architecture.md)
 
-The `telellm_public` network must exist before the daemon starts because the example config attaches each sandbox to it. The doctor can create this network for you with `--create-network`.
-
-6. Build the sandbox image:
+## Quick Start
 
 ```bash
+cp config.example.toml config.toml
+export TELEGRAM_BOT_TOKEN=...
+export OPENAI_API_KEY=...
 docker build -f Dockerfile.sandbox -t telellm-sandbox:local .
-```
-
-7. Run the setup doctor:
-
-```bash
-cargo run -- doctor --config config.toml
 cargo run -- doctor --config config.toml --create-network
+cargo run -- run --config config.toml
 ```
 
-8. Run checks:
+The example config uses broker API key mode. To use a ChatGPT/Codex subscription login instead, run `codex login --device-auth` on the host, set `codex.auth_mode = "chatgpt_oauth"` and `codex.auth_host_path` to your host `auth.json`, then remove the need for `OPENAI_API_KEY`.
+
+Use a Telegram test group while bringing the daemon up. Set `allowed_chat_ids` before adding the bot to broader groups.
+
+## Development Checks
 
 ```bash
 ./scripts/check.sh
 ```
 
-9. Start the daemon:
+The script runs formatting, tests, and Clippy:
 
 ```bash
-cargo run -- run --config config.toml
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
 ```
-
-## Group Commands
-
-`/remember <fact>` stores a host-managed group memory record. The sandbox can see remembered facts as prompt context, but cannot directly edit the host memory database.
 
 ## Security Model
 
-Each Telegram group maps to a Docker/Colima sandbox and persistent workspace volume. The daemon owns Telegram credentials, durable memory, and long-lived provider credentials. The sandbox receives only scoped access to the host broker and must not receive arbitrary host mounts or the Docker socket.
+Each Telegram group maps to a Docker/Colima sandbox and persistent workspace volume. In broker API key mode, the daemon owns Telegram credentials, durable memory, broker tokens, and the upstream provider credential. In ChatGPT OAuth mode, the sandbox receives a copied Codex auth file for subscription-backed Codex CLI use. The Docker socket is never mounted.
+
+Read the full model in:
+
+- [Runtime and security model](docs/explanation/runtime-and-security.md)
+- [Sandbox reference](docs/reference/sandbox.md)
+- [Broker reference](docs/reference/broker.md)

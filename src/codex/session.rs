@@ -20,6 +20,8 @@ pub trait CodexSession: Send + Sync {
 pub enum CodexSessionError {
     #[error("pty error: {0}")]
     Pty(String),
+    #[error("process error: {0}")]
+    Process(String),
     #[error("session closed")]
     Closed,
 }

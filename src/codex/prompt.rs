@@ -35,8 +35,10 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: "@telellm_bot hello".to_owned(),
             reply_to_bot: false,
+            private_chat: false,
         };
         let packet = ContextPacket {
+            system_prompt: "System prompt.".to_owned(),
             triggering_message: message,
             recent_messages: Vec::new(),
             memories: Vec::new(),

@@ -171,13 +171,21 @@ impl PtyInner {
                     ));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Ok(clean_pty_output(prompt, &output));
+                    let cleaned = clean_pty_output(prompt, &output);
+                    if turn_output_is_incomplete(prompt, &cleaned) {
+                        continue;
+                    }
+                    return Ok(cleaned);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) if output.is_empty() => {
                     return Err(CodexSessionError::Closed);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Ok(clean_pty_output(prompt, &output));
+                    let cleaned = clean_pty_output(prompt, &output);
+                    if turn_output_is_incomplete(prompt, &cleaned) {
+                        return Err(CodexSessionError::Closed);
+                    }
+                    return Ok(cleaned);
                 }
             }
         }
@@ -211,6 +219,36 @@ fn clean_pty_output(prompt: &str, output: &[u8]) -> String {
     strip_prompt_echo(prompt, &without_ansi)
         .trim_matches('\n')
         .to_owned()
+}
+
+fn turn_output_is_incomplete(prompt: &str, output: &str) -> bool {
+    let trimmed = output.trim();
+    trimmed.is_empty()
+        || output_is_only_prompt_echo(prompt, trimmed)
+        || output_is_interactive_codex_prompt(trimmed)
+}
+
+fn output_is_only_prompt_echo(prompt: &str, output: &str) -> bool {
+    let compact_prompt = compact_terminal_text(prompt);
+    let compact_output = compact_terminal_text(output);
+
+    !compact_prompt.is_empty()
+        && !compact_output.is_empty()
+        && (compact_prompt == compact_output || compact_prompt.starts_with(&compact_output))
+}
+
+fn output_is_interactive_codex_prompt(output: &str) -> bool {
+    let compact_output = compact_terminal_text(output);
+    compact_output.contains("doyoutrustthecontentsofthisdirectory")
+        || compact_output.contains("pressentertocontinue")
+}
+
+fn compact_terminal_text(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn normalize_newlines(input: &str) -> String {
@@ -293,5 +331,26 @@ mod tests {
         let cleaned = clean_pty_output("hello", raw);
 
         assert_eq!(cleaned, "answer");
+    }
+
+    #[test]
+    fn turn_output_is_incomplete_should_detect_prompt_echo() {
+        let prompt = "Line one\nLine two";
+
+        assert!(turn_output_is_incomplete(prompt, "Line one\nLine two"));
+    }
+
+    #[test]
+    fn turn_output_is_incomplete_should_detect_partial_prompt_echo() {
+        let prompt = "Line one\nLine two";
+
+        assert!(turn_output_is_incomplete(prompt, "Line one"));
+    }
+
+    #[test]
+    fn turn_output_is_incomplete_should_detect_codex_trust_prompt() {
+        let output = "Do you trust the contents of this directory?\n1. Yes, continue\nPress enter to continue";
+
+        assert!(turn_output_is_incomplete("hello", output));
     }
 }

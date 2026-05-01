@@ -44,6 +44,7 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             reply_to_bot: false,
+            private_chat: false,
         }
     }
 

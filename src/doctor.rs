@@ -1,5 +1,9 @@
-use crate::config::AppConfig;
-use std::{fmt, path::PathBuf, process::Output};
+use crate::config::{AppConfig, CodexAuthMode};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    process::Output,
+};
 use tokio::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,10 +97,32 @@ pub async fn run(options: DoctorOptions) -> DoctorReport {
         "telegram token env",
         &config.telegram.bot_token_env,
     ));
-    report.push(env_check(
-        "upstream API key env",
-        &config.broker.upstream_api_key_env,
-    ));
+    let auth_file_available = match config.codex.auth_mode {
+        CodexAuthMode::BrokerApiKey => {
+            let broker = match config.broker_config() {
+                Ok(broker) => broker,
+                Err(error) => {
+                    report.push(DoctorCheck::failed(
+                        "broker config",
+                        format!("broker config is invalid: {error}"),
+                    ));
+                    push_docker_dependent_skips(&mut report);
+                    return report;
+                }
+            };
+            report.push(env_check(
+                "upstream API key env",
+                &broker.upstream_api_key_env,
+            ));
+            None
+        }
+        CodexAuthMode::ChatgptOauth => {
+            let check = codex_auth_file_check(config.codex_auth_host_path());
+            let passed = check.status == DoctorStatus::Passed;
+            report.push(check);
+            Some(passed)
+        }
+    };
 
     let docker_available = docker_version_check().await;
     let can_use_docker = docker_available.status == DoctorStatus::Passed;
@@ -115,6 +141,12 @@ pub async fn run(options: DoctorOptions) -> DoctorReport {
             "codex version probe",
             "skipped because Docker CLI did not respond successfully",
         ));
+        if config.codex.auth_mode == CodexAuthMode::ChatgptOauth {
+            report.push(DoctorCheck::skipped(
+                "codex auth probe",
+                "skipped because Docker CLI did not respond successfully",
+            ));
+        }
         return report;
     }
 
@@ -128,11 +160,33 @@ pub async fn run(options: DoctorOptions) -> DoctorReport {
 
     if image_available && network_available {
         report.push(codex_version_probe_check(&config.docker.image, &config.docker.network).await);
+        if config.codex.auth_mode == CodexAuthMode::ChatgptOauth {
+            if auth_file_available == Some(true) {
+                let auth_path = config
+                    .codex_auth_host_path()
+                    .expect("validated OAuth config should have an auth path");
+                report.push(
+                    codex_auth_probe_check(&config.docker.image, &config.docker.network, auth_path)
+                        .await,
+                );
+            } else {
+                report.push(DoctorCheck::skipped(
+                    "codex auth probe",
+                    "skipped because the Codex auth file is unavailable",
+                ));
+            }
+        }
     } else {
         report.push(DoctorCheck::skipped(
             "codex version probe",
             "skipped because the sandbox image or Docker network is unavailable",
         ));
+        if config.codex.auth_mode == CodexAuthMode::ChatgptOauth {
+            report.push(DoctorCheck::skipped(
+                "codex auth probe",
+                "skipped because the sandbox image or Docker network is unavailable",
+            ));
+        }
     }
 
     report
@@ -162,6 +216,28 @@ pub fn codex_version_probe_args(image: &str, network: &str) -> Vec<String> {
     ]
 }
 
+pub fn codex_auth_probe_args(image: &str, network: &str, auth_host_path: &Path) -> Vec<String> {
+    vec![
+        "run".to_owned(),
+        "--rm".to_owned(),
+        "--network".to_owned(),
+        network.to_owned(),
+        "--cap-add".to_owned(),
+        "NET_ADMIN".to_owned(),
+        "--security-opt".to_owned(),
+        "no-new-privileges".to_owned(),
+        "-v".to_owned(),
+        format!(
+            "{}:/run/telellm/codex-auth.json:ro",
+            auth_host_path.display()
+        ),
+        image.to_owned(),
+        "codex".to_owned(),
+        "login".to_owned(),
+        "status".to_owned(),
+    ]
+}
+
 fn docker_image_inspect_args(image: &str) -> Vec<String> {
     vec!["image".to_owned(), "inspect".to_owned(), image.to_owned()]
 }
@@ -178,6 +254,22 @@ fn push_config_dependent_skips(report: &mut DoctorReport) {
     for check_name in [
         "telegram token env",
         "upstream API key env",
+        "codex auth file",
+        "Docker CLI",
+        "sandbox image",
+        "docker network",
+        "codex version probe",
+        "codex auth probe",
+    ] {
+        report.push(DoctorCheck::skipped(
+            check_name,
+            "skipped because the config did not load",
+        ));
+    }
+}
+
+fn push_docker_dependent_skips(report: &mut DoctorReport) {
+    for check_name in [
         "Docker CLI",
         "sandbox image",
         "docker network",
@@ -185,7 +277,7 @@ fn push_config_dependent_skips(report: &mut DoctorReport) {
     ] {
         report.push(DoctorCheck::skipped(
             check_name,
-            "skipped because the config did not load",
+            "skipped because auth-dependent config did not load",
         ));
     }
 }
@@ -204,6 +296,40 @@ fn env_check(name: &str, env_name: &str) -> DoctorCheck {
         Err(std::env::VarError::NotUnicode(_)) => DoctorCheck::failed(
             name,
             format!("environment variable `{env_name}` is not valid Unicode"),
+        ),
+    }
+}
+
+fn codex_auth_file_check(path: Result<&Path, crate::config::ConfigError>) -> DoctorCheck {
+    let path = match path {
+        Ok(path) => path,
+        Err(error) => {
+            return DoctorCheck::failed("codex auth file", error.to_string());
+        }
+    };
+
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => DoctorCheck::failed(
+            "codex auth file",
+            format!("auth path `{}` is not a file", path.display()),
+        ),
+        Ok(metadata) if metadata.len() == 0 => DoctorCheck::failed(
+            "codex auth file",
+            format!("auth file `{}` is empty", path.display()),
+        ),
+        Ok(_) => match std::fs::File::open(path) {
+            Ok(_) => DoctorCheck::passed(
+                "codex auth file",
+                format!("auth file `{}` exists and is readable", path.display()),
+            ),
+            Err(error) => DoctorCheck::failed(
+                "codex auth file",
+                format!("auth file `{}` is not readable: {error}", path.display()),
+            ),
+        },
+        Err(error) => DoctorCheck::failed(
+            "codex auth file",
+            format!("auth file `{}` is not readable: {error}", path.display()),
         ),
     }
 }
@@ -293,6 +419,19 @@ async fn codex_version_probe_check(image: &str, network: &str) -> DoctorCheck {
         Err(error) => DoctorCheck::failed(
             "codex version probe",
             format!("failed to run codex version probe: {error}"),
+        ),
+    }
+}
+
+async fn codex_auth_probe_check(image: &str, network: &str, auth_host_path: &Path) -> DoctorCheck {
+    match docker_output(codex_auth_probe_args(image, network, auth_host_path)).await {
+        Ok(output) if output.status.success() => {
+            DoctorCheck::passed("codex auth probe", "codex login status succeeded")
+        }
+        Ok(output) => DoctorCheck::failed("codex auth probe", output_failure_detail(&output)),
+        Err(error) => DoctorCheck::failed(
+            "codex auth probe",
+            format!("failed to run codex auth probe: {error}"),
         ),
     }
 }
@@ -400,5 +539,35 @@ mod tests {
         );
         assert!(args.contains(&"telellm-sandbox:local".to_owned()));
         assert!(args.ends_with(&["codex".to_owned(), "--version".to_owned()]));
+    }
+
+    #[test]
+    fn codex_auth_probe_args_should_mount_auth_file_and_check_login_status() {
+        let args = codex_auth_probe_args(
+            "telellm-sandbox:local",
+            "telellm_public",
+            Path::new("/Users/michaelasper/.codex/auth.json"),
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--network", "telellm_public"])
+        );
+        assert!(args.windows(2).any(|window| window[0] == "-v"
+            && window[1]
+                == "/Users/michaelasper/.codex/auth.json:/run/telellm/codex-auth.json:ro"));
+        assert!(args.ends_with(&["codex".to_owned(), "login".to_owned(), "status".to_owned()]));
+    }
+
+    #[test]
+    fn codex_auth_file_check_should_reject_empty_file() {
+        let path = std::env::temp_dir().join(format!("telellm-empty-auth-{}", std::process::id()));
+        std::fs::write(&path, "").expect("empty auth fixture should be written");
+
+        let check = codex_auth_file_check(Ok(&path));
+
+        std::fs::remove_file(&path).expect("empty auth fixture should be removed");
+        assert_eq!(check.status, DoctorStatus::Failed);
+        assert!(check.detail.contains("is empty"));
     }
 }

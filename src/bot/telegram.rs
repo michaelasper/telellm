@@ -145,6 +145,7 @@ fn normalize_message(
         from_name,
         text,
         reply_to_bot,
+        private_chat: message.chat.is_private(),
     })
 }
 

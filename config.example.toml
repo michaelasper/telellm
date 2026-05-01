@@ -3,6 +3,12 @@ bot_token_env = "TELEGRAM_BOT_TOKEN"
 bot_username = "telellm_bot"
 allowed_chat_ids = []
 
+[prompt]
+system_prompt = """
+You are the Telegram group assistant for this chat.
+Respond only to the triggering message. Use recent chat and memory as context.
+"""
+
 [storage]
 sqlite_path = "data/telellm.sqlite"
 
@@ -15,7 +21,14 @@ workspace_volume_prefix = "telellm_workspace"
 command = "codex"
 args = ["--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"]
 model = "gpt-5-codex"
+# Broker API key mode is the default and keeps the upstream provider key on the host.
+auth_mode = "broker_api_key"
+# To use a ChatGPT/Codex subscription login instead, run `codex login --device-auth`
+# on the host, then use:
+# auth_mode = "chatgpt_oauth"
+# auth_host_path = "/absolute/path/to/.codex/auth.json"
 
+# Required only when codex.auth_mode is "broker_api_key".
 [broker]
 listen = "127.0.0.1:8189"
 public_base_url = "http://host.docker.internal:8189/v1"

@@ -4,7 +4,7 @@ use crate::{
         message::{Addressing, IncomingMessage},
         telegram::{IncomingMessageHandler, TelegramError},
     },
-    config::AppConfig,
+    config::{AppConfig, CodexAuthMode},
     memory::{MemoryKind, MemoryStore, RollingBuffer, context::ContextPacket},
     router::{GroupWorkItem, Router, RouterError},
     runtime::{ChatRuntimeStatus, RuntimeControl, RuntimeState},
@@ -27,29 +27,33 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             .with_context(|| format!("failed to create data directory {}", parent.display()))?;
     }
 
-    let upstream_api_key =
-        std::env::var(&config.broker.upstream_api_key_env).with_context(|| {
+    if config.codex.auth_mode == CodexAuthMode::BrokerApiKey {
+        let broker = config.broker_config()?;
+        let upstream_api_key = std::env::var(&broker.upstream_api_key_env).with_context(|| {
             format!(
                 "required upstream API key env var `{}` is not set",
-                config.broker.upstream_api_key_env
+                broker.upstream_api_key_env
             )
         })?;
-    let broker_state = crate::broker::BrokerState::new_with_limits(
-        crate::broker::BrokerConfig {
-            listen: config.broker.listen,
-            upstream_base_url: config.broker.upstream_base_url.clone(),
-            upstream_api_key: secrecy::SecretString::from(upstream_api_key),
-        },
-        crate::config::broker_limits(&config),
-    );
-    let broker_listener = tokio::net::TcpListener::bind(config.broker.listen)
-        .await
-        .with_context(|| format!("failed to bind broker at {}", config.broker.listen))?;
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(broker_listener, crate::broker::router(broker_state)).await {
-            tracing::error!(error = %err, "broker server stopped");
-        }
-    });
+        let broker_state = crate::broker::BrokerState::new_with_limits(
+            crate::broker::BrokerConfig {
+                listen: broker.listen,
+                upstream_base_url: broker.upstream_base_url.clone(),
+                upstream_api_key: secrecy::SecretString::from(upstream_api_key),
+            },
+            crate::config::broker_limits(&config),
+        );
+        let broker_listener = tokio::net::TcpListener::bind(broker.listen)
+            .await
+            .with_context(|| format!("failed to bind broker at {}", broker.listen))?;
+        tokio::spawn(async move {
+            if let Err(err) =
+                axum::serve(broker_listener, crate::broker::router(broker_state)).await
+            {
+                tracing::error!(error = %err, "broker server stopped");
+            }
+        });
+    }
 
     let telegram_token = config.telegram_token_from_env()?;
     let bot = teloxide::Bot::new(telegram_token.expose_secret().to_owned());
@@ -74,6 +78,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     ));
     let app_core = Arc::new(AppCore::new(
         config.telegram.bot_username.clone(),
+        config.prompt.system_prompt.clone(),
         allowed_chat_ids,
         memory_store,
         RollingBuffer::new(config.limits.recent_buffer_messages),
@@ -93,6 +98,7 @@ where
     N: RuntimeControl + 'static,
 {
     bot_username: String,
+    system_prompt: String,
     allowed_chat_ids: Vec<crate::ids::ChatId>,
     memory_store: Arc<M>,
     rolling: Arc<Mutex<RollingBuffer>>,
@@ -109,6 +115,7 @@ where
 {
     pub fn new(
         bot_username: String,
+        system_prompt: String,
         allowed_chat_ids: Vec<crate::ids::ChatId>,
         memory_store: Arc<M>,
         rolling: RollingBuffer,
@@ -117,6 +124,7 @@ where
     ) -> Self {
         Self {
             bot_username,
+            system_prompt,
             allowed_chat_ids,
             memory_store,
             rolling: Arc::new(Mutex::new(rolling)),
@@ -146,6 +154,7 @@ where
         let recent_messages = self.rolling.lock().await.recent_for_chat(message.chat_id);
         let memories = self.memory_store.list_memories(message.chat_id).await?;
         let packet = ContextPacket {
+            system_prompt: self.system_prompt.clone(),
             triggering_message: message.clone(),
             recent_messages,
             memories,
@@ -373,7 +382,12 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             reply_to_bot: false,
+            private_chat: false,
         }
+    }
+
+    fn test_system_prompt() -> String {
+        "Test system prompt.".to_owned()
     }
 
     #[tokio::test]
@@ -407,7 +421,23 @@ mod tests {
             .expect("addressed message should be handled");
         let response = messages.recv().await.expect("response should be sent");
 
+        assert!(response.starts_with("Test system prompt."));
         assert!(response.contains("@telellm_bot hello"));
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_message_should_enqueue_plain_private_chat_context() {
+        let (app, runtime, mut messages) = app_with_fakes().await;
+        let mut message = incoming("hello from a DM");
+        message.private_chat = true;
+
+        app.handle_message(message)
+            .await
+            .expect("plain private chat message should be handled");
+        let response = messages.recv().await.expect("response should be sent");
+
+        assert!(response.contains("hello from a DM"));
         assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -494,6 +524,7 @@ mod tests {
         let runtime = Arc::new(FakeRuntime::default());
         let app = AppCore::new(
             "telellm_bot".to_owned(),
+            test_system_prompt(),
             Vec::new(),
             memory,
             RollingBuffer::new(10),
@@ -558,6 +589,7 @@ mod tests {
         let runtime = Arc::new(FakeRuntime::default());
         let app = AppCore::new(
             "telellm_bot".to_owned(),
+            test_system_prompt(),
             Vec::new(),
             memory,
             RollingBuffer::new(10),
@@ -583,6 +615,7 @@ mod tests {
         let runtime = Arc::new(FakeRuntime::default());
         let app = AppCore::new(
             "telellm_bot".to_owned(),
+            test_system_prompt(),
             allowed_chat_ids,
             memory,
             RollingBuffer::new(10),

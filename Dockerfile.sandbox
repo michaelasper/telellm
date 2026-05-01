@@ -16,6 +16,8 @@ RUN apt-get update \
 RUN npm install -g @openai/codex
 
 RUN useradd --create-home --shell /bin/bash codex
+RUN mkdir -p /home/codex/.codex /run/telellm \
+    && chown -R codex:codex /home/codex/.codex
 ENV HOME=/home/codex
 WORKDIR /workspace
 

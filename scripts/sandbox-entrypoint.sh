@@ -7,16 +7,34 @@ if command -v ip6tables >/dev/null 2>&1 && ip6tables -L OUTPUT >/dev/null 2>&1; 
   ip6tables_enabled=1
 fi
 
+allow_dns_to_ipv4() {
+  local ip="$1"
+  if [[ -n "$ip" && "$ip" != *:* ]]; then
+    iptables -A OUTPUT -d "$ip" -p udp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -d "$ip" -p tcp --dport 53 -j ACCEPT
+  fi
+}
+
+allow_all_to_ipv4() {
+  local ip="$1"
+  if [[ -n "$ip" && "$ip" != *:* ]]; then
+    iptables -A OUTPUT -d "$ip" -j ACCEPT
+  fi
+}
+
 while read -r directive nameserver _; do
-  if [[ "$directive" == "nameserver" && -n "${nameserver:-}" && "$nameserver" != *:* ]]; then
-    iptables -A OUTPUT -d "$nameserver" -p udp --dport 53 -j ACCEPT
-    iptables -A OUTPUT -d "$nameserver" -p tcp --dport 53 -j ACCEPT
+  if [[ "$directive" == "nameserver" ]]; then
+    allow_dns_to_ipv4 "${nameserver:-}"
   fi
 done < /etc/resolv.conf
 
+while IFS= read -r upstream_dns_ip; do
+  allow_dns_to_ipv4 "$upstream_dns_ip"
+done < <(sed -nE 's/.*ExtServers: \[host\(([0-9.]+)\)\].*/\1/p' /etc/resolv.conf)
+
 docker_dns_ip="${DOCKER_DNS_IP:-127.0.0.11}"
-iptables -A OUTPUT -d "$docker_dns_ip" -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -d "$docker_dns_ip" -p tcp --dport 53 -j ACCEPT
+allow_all_to_ipv4 "$docker_dns_ip"
+allow_dns_to_ipv4 "$docker_dns_ip"
 
 if [[ -n "${TELELLM_BROKER_HOST:-}" ]]; then
   broker_ip="$(getent hosts "$TELELLM_BROKER_HOST" | awk '{ print $1 }' | head -n 1)"
@@ -37,7 +55,6 @@ fi
 for cidr in \
   0.0.0.0/8 \
   10.0.0.0/8 \
-  127.0.0.0/8 \
   169.254.0.0/16 \
   172.16.0.0/12 \
   192.168.0.0/16 \
@@ -57,6 +74,21 @@ if [[ "$ip6tables_enabled" == "1" ]]; then
     ip6tables -A OUTPUT -d "$cidr" -j REJECT
   done
 fi
+
+if [[ -f /run/telellm/codex-auth.json ]]; then
+  install -d -m 700 -o codex -g codex /home/codex/.codex
+  install -m 600 -o codex -g codex /run/telellm/codex-auth.json /home/codex/.codex/auth.json
+fi
+
+codex_config="$(mktemp)"
+{
+  printf '[projects."/workspace"]\n'
+  printf 'trust_level = "trusted"\n'
+  printf '\n[notice]\n'
+  printf 'hide_full_access_warning = true\n'
+} > "$codex_config"
+install -m 600 -o codex -g codex "$codex_config" /home/codex/.codex/config.toml
+rm -f "$codex_config"
 
 chown codex:codex /workspace
 

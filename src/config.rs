@@ -1,16 +1,23 @@
 use secrecy::SecretString;
 use serde::Deserialize;
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::ids::ChatId;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub telegram: TelegramConfig,
+    #[serde(default)]
+    pub prompt: PromptConfig,
     pub storage: StorageConfig,
     pub docker: DockerConfig,
     pub codex: CodexConfig,
-    pub broker: BrokerConfig,
+    pub broker: Option<BrokerConfig>,
     #[serde(default)]
     pub limits: LimitsConfig,
 }
@@ -21,6 +28,20 @@ pub struct TelegramConfig {
     pub bot_username: String,
     #[serde(default)]
     pub allowed_chat_ids: Vec<ChatId>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptConfig {
+    #[serde(default = "default_system_prompt")]
+    pub system_prompt: String,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            system_prompt: default_system_prompt(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,8 +62,19 @@ pub struct CodexConfig {
     #[serde(default)]
     pub args: Vec<String>,
     pub model: String,
+    #[serde(default = "default_codex_auth_mode")]
+    pub auth_mode: CodexAuthMode,
+    #[serde(default)]
+    pub auth_host_path: Option<PathBuf>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAuthMode {
+    BrokerApiKey,
+    ChatgptOauth,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +141,7 @@ impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         require_non_empty("telegram.bot_token_env", &self.telegram.bot_token_env)?;
         require_non_empty("telegram.bot_username", &self.telegram.bot_username)?;
+        require_non_empty("prompt.system_prompt", &self.prompt.system_prompt)?;
         require_non_empty("docker.image", &self.docker.image)?;
         require_non_empty("docker.network", &self.docker.network)?;
         require_non_empty(
@@ -117,12 +150,32 @@ impl AppConfig {
         )?;
         require_non_empty("codex.command", &self.codex.command)?;
         require_non_empty("codex.model", &self.codex.model)?;
-        require_non_empty("broker.public_base_url", &self.broker.public_base_url)?;
-        require_non_empty("broker.upstream_base_url", &self.broker.upstream_base_url)?;
-        require_non_empty(
-            "broker.upstream_api_key_env",
-            &self.broker.upstream_api_key_env,
-        )?;
+        match self.codex.auth_mode {
+            CodexAuthMode::BrokerApiKey => {
+                let broker = self.broker.as_ref().ok_or(ConfigError::InvalidValue {
+                    field: "broker",
+                    reason: "is required when codex.auth_mode is broker_api_key",
+                })?;
+                validate_broker_config(broker)?;
+            }
+            CodexAuthMode::ChatgptOauth => {
+                let Some(auth_host_path) = &self.codex.auth_host_path else {
+                    return Err(ConfigError::InvalidValue {
+                        field: "codex.auth_host_path",
+                        reason: "is required when codex.auth_mode is chatgpt_oauth",
+                    });
+                };
+                if path_is_empty_or_whitespace(auth_host_path) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "codex.auth_host_path",
+                        reason: "must not be empty",
+                    });
+                }
+                if let Some(broker) = &self.broker {
+                    validate_broker_config(broker)?;
+                }
+            }
+        }
 
         if self.limits.per_group_queue_depth == 0 {
             return Err(ConfigError::InvalidValue {
@@ -184,6 +237,33 @@ impl AppConfig {
         })?;
         Ok(SecretString::from(value))
     }
+
+    pub fn broker_config(&self) -> Result<&BrokerConfig, ConfigError> {
+        self.broker.as_ref().ok_or(ConfigError::InvalidValue {
+            field: "broker",
+            reason: "is required when codex.auth_mode is broker_api_key",
+        })
+    }
+
+    pub fn codex_auth_host_path(&self) -> Result<&Path, ConfigError> {
+        self.codex
+            .auth_host_path
+            .as_deref()
+            .ok_or(ConfigError::InvalidValue {
+                field: "codex.auth_host_path",
+                reason: "is required when codex.auth_mode is chatgpt_oauth",
+            })
+    }
+}
+
+fn validate_broker_config(broker: &BrokerConfig) -> Result<(), ConfigError> {
+    require_non_empty("broker.public_base_url", &broker.public_base_url)?;
+    require_non_empty("broker.upstream_base_url", &broker.upstream_base_url)?;
+    require_non_empty("broker.upstream_api_key_env", &broker.upstream_api_key_env)
+}
+
+fn path_is_empty_or_whitespace(path: &Path) -> bool {
+    path.as_os_str().is_empty() || path.to_string_lossy().trim().is_empty()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -270,6 +350,14 @@ fn default_codex_max_output_bytes() -> usize {
     512 * 1024
 }
 
+fn default_codex_auth_mode() -> CodexAuthMode {
+    CodexAuthMode::BrokerApiKey
+}
+
+fn default_system_prompt() -> String {
+    "You are the Telegram group assistant for this chat.\nRespond only to the triggering message. Use recent chat and memory as context.".to_owned()
+}
+
 fn default_broker_max_requests_per_window() -> usize {
     120
 }
@@ -302,7 +390,7 @@ mod tests {
 
             [codex]
             command = "codex"
-            args = ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+            args = ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]
             model = "gpt-5-codex"
 
             [broker]
@@ -318,6 +406,45 @@ mod tests {
         let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
 
         assert_eq!(config.telegram.bot_username, "telellm_bot");
+    }
+
+    #[test]
+    fn from_toml_str_should_apply_default_system_prompt() {
+        let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
+
+        assert!(
+            config
+                .prompt
+                .system_prompt
+                .contains("Telegram group assistant")
+        );
+    }
+
+    #[test]
+    fn from_toml_str_should_parse_configured_system_prompt() {
+        let raw = valid_config().replace(
+            "[storage]",
+            "[prompt]\nsystem_prompt = \"Custom system prompt.\"\n\n[storage]",
+        );
+
+        let config = AppConfig::from_toml_str(&raw).expect("config should parse");
+
+        assert_eq!(config.prompt.system_prompt, "Custom system prompt.");
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_empty_system_prompt() {
+        let raw = valid_config().replace(
+            "[storage]",
+            "[prompt]\nsystem_prompt = \"   \"\n\n[storage]",
+        );
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `prompt.system_prompt` is invalid: must not be empty"
+        );
     }
 
     #[test]
@@ -352,6 +479,131 @@ mod tests {
         let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
 
         assert_eq!(config.limits.per_group_queue_depth, 16);
+    }
+
+    #[test]
+    fn from_toml_str_should_default_to_broker_api_key_auth() {
+        let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
+
+        assert_eq!(config.codex.auth_mode, CodexAuthMode::BrokerApiKey);
+    }
+
+    #[test]
+    fn from_toml_str_should_parse_chatgpt_oauth_without_broker_config() {
+        let raw = r#"
+            [telegram]
+            bot_token_env = "TELEGRAM_BOT_TOKEN"
+            bot_username = "telellm_bot"
+
+            [storage]
+            sqlite_path = "data/telellm.sqlite"
+
+            [docker]
+            image = "telellm-sandbox:local"
+            network = "telellm_public"
+            workspace_volume_prefix = "telellm_workspace"
+
+            [codex]
+            command = "codex"
+            args = ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]
+            model = "gpt-5-codex"
+            auth_mode = "chatgpt_oauth"
+            auth_host_path = "/Users/michaelasper/.codex/auth.json"
+        "#;
+
+        let config = AppConfig::from_toml_str(raw).expect("config should parse");
+
+        assert_eq!(config.codex.auth_mode, CodexAuthMode::ChatgptOauth);
+        assert!(config.broker.is_none());
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_chatgpt_oauth_without_auth_host_path() {
+        let raw = valid_config()
+            .replace(
+                "model = \"gpt-5-codex\"",
+                "model = \"gpt-5-codex\"\n            auth_mode = \"chatgpt_oauth\"",
+            )
+            .replace(
+                r#"
+            [broker]
+            listen = "127.0.0.1:8189"
+            public_base_url = "http://host.docker.internal:8189/v1"
+            upstream_base_url = "https://api.openai.com/v1"
+            upstream_api_key_env = "OPENAI_API_KEY"
+        "#,
+                "",
+            );
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `codex.auth_host_path` is invalid: is required when codex.auth_mode is chatgpt_oauth"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_chatgpt_oauth_empty_auth_host_path() {
+        let raw = r#"
+            [telegram]
+            bot_token_env = "TELEGRAM_BOT_TOKEN"
+            bot_username = "telellm_bot"
+
+            [storage]
+            sqlite_path = "data/telellm.sqlite"
+
+            [docker]
+            image = "telellm-sandbox:local"
+            network = "telellm_public"
+            workspace_volume_prefix = "telellm_workspace"
+
+            [codex]
+            command = "codex"
+            model = "gpt-5-codex"
+            auth_mode = "chatgpt_oauth"
+            auth_host_path = "   "
+        "#;
+
+        let err = AppConfig::from_toml_str(raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `codex.auth_host_path` is invalid: must not be empty"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_broker_api_key_without_broker_config() {
+        let raw = valid_config().replace(
+            r#"
+            [broker]
+            listen = "127.0.0.1:8189"
+            public_base_url = "http://host.docker.internal:8189/v1"
+            upstream_base_url = "https://api.openai.com/v1"
+            upstream_api_key_env = "OPENAI_API_KEY"
+        "#,
+            "",
+        );
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert_eq!(
+            err.to_string(),
+            "config field `broker` is invalid: is required when codex.auth_mode is broker_api_key"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_should_reject_unknown_codex_auth_mode() {
+        let raw = valid_config().replace(
+            "model = \"gpt-5-codex\"",
+            "model = \"gpt-5-codex\"\n            auth_mode = \"session_cookie\"",
+        );
+
+        let err = AppConfig::from_toml_str(&raw).expect_err("config should be invalid");
+
+        assert!(err.to_string().contains("unknown variant `session_cookie`"));
     }
 
     #[test]
