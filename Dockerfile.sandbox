@@ -1,0 +1,27 @@
+FROM node:24-bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        iproute2 \
+        iptables \
+        openssh-client \
+        procps \
+        python3 \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @openai/codex
+
+RUN useradd --create-home --shell /bin/bash codex
+ENV HOME=/home/codex
+WORKDIR /workspace
+
+COPY scripts/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
+RUN chmod +x /usr/local/bin/sandbox-entrypoint.sh
+
+USER root
+ENTRYPOINT ["/usr/local/bin/sandbox-entrypoint.sh"]
+CMD ["sleep", "infinity"]
