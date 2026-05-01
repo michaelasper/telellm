@@ -1,0 +1,28 @@
+[telegram]
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+bot_username = "telellm_bot"
+
+[storage]
+sqlite_path = "data/telellm.sqlite"
+
+[docker]
+image = "telellm-sandbox:local"
+network = "telellm_public"
+workspace_volume_prefix = "telellm_workspace"
+
+[codex]
+command = "codex"
+args = ["--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"]
+model = "gpt-5-codex"
+
+[broker]
+listen = "127.0.0.1:8189"
+public_base_url = "http://host.docker.internal:8189/v1"
+upstream_base_url = "https://api.openai.com/v1"
+upstream_api_key_env = "OPENAI_API_KEY"
+
+[limits]
+per_group_queue_depth = 16
+telegram_chunk_chars = 3900
+recent_buffer_messages = 200
+codex_inactivity_secs = 600
