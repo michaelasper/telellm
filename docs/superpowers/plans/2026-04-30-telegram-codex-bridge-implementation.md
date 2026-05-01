@@ -3369,9 +3369,846 @@ Skip the commit if `git status --short` is empty.
 
 ---
 
+### Task 17: Post-Review Runtime And Sandbox Hardening
+
+**Files:**
+- Modified: `src/broker.rs`
+- Modified: `src/codex/pty.rs`
+- Modified: `src/runtime.rs`
+- Modified: `src/sandbox/docker.rs`
+- Modified: `src/sandbox/mod.rs`
+- Modified: `src/sandbox/network.rs`
+- Modified: `scripts/sandbox-entrypoint.sh`
+- Modified: `tests/pty_session.rs`
+
+**Execution notes:**
+- Commit `0d08e14 fix: harden sandbox runtime boundaries` landed after Task 16.
+- `docker exec` now allocates stdin and a TTY for interactive Codex sessions.
+- PTY reads now collect output until inactivity, support responses larger than one read buffer, and strip prompt echo plus ANSI control output.
+- The broker now requires the sandbox bearer token before proxying with host-held upstream credentials.
+- Cold starts for the same chat are serialized with per-chat startup locks.
+- The sandbox entrypoint and generated policy now install IPv6 local/private rejects when `ip6tables` is available.
+- The sandbox bearer token constant is shared between broker validation and sandbox spec construction.
+
+- [x] **Step 1: Verify the full Rust check suite**
+
+Run:
+
+```bash
+./scripts/check.sh
+```
+
+Expected: PASS with unit tests, integration tests, doc tests, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+
+- [x] **Step 2: Verify Docker sandbox image and ignored integration tests**
+
+Run:
+
+```bash
+docker build -f Dockerfile.sandbox -t telellm-sandbox:local .
+cargo test --test docker_sandbox -- --ignored
+```
+
+Expected: image builds; public internet test passes; private LAN probe is rejected.
+
+- [x] **Step 3: Verify live IPv6 firewall rules inside a container**
+
+Run:
+
+```bash
+docker rm -f telellm-ipv6-rule-test
+docker run -d --name telellm-ipv6-rule-test --cap-add NET_ADMIN telellm-sandbox:local sleep infinity
+docker exec --user root telellm-ipv6-rule-test ip6tables -S OUTPUT
+docker rm -f telellm-ipv6-rule-test
+```
+
+Expected: `ip6tables -S OUTPUT` includes rejects for `::/128`, `::1/128`, `fc00::/7`, `fe80::/10`, and `ff00::/8`.
+
+- [x] **Step 4: Commit**
+
+Run:
+
+```bash
+git add scripts/sandbox-entrypoint.sh src/broker.rs src/codex/pty.rs src/runtime.rs src/sandbox/docker.rs src/sandbox/mod.rs src/sandbox/network.rs tests/pty_session.rs
+git commit -m "fix: harden sandbox runtime boundaries"
+```
+
+Expected: commit `0d08e14` or newer equivalent exists.
+
+---
+
+## Continuation: Operational MVP Readiness
+
+The first implementation pass now compiles, passes tests, and has the major review findings fixed. The next phase should make the daemon easier to run in a real Telegram group and close the remaining security/runtime gaps from the design spec.
+
+### Task 18: Add Setup Doctor And Network Bootstrap
+
+**Files:**
+- Create: `src/doctor.rs`
+- Modify: `src/lib.rs`
+- Modify: `src/main.rs`
+- Modify: `README.md`
+- Test: `src/doctor.rs`
+
+- [ ] **Step 1: Add `doctor` module export**
+
+Edit `src/lib.rs`:
+
+```rust
+pub mod app;
+pub mod bot;
+pub mod broker;
+pub mod codex;
+pub mod config;
+pub mod doctor;
+pub mod ids;
+pub mod memory;
+pub mod router;
+pub mod runtime;
+pub mod sandbox;
+```
+
+- [ ] **Step 2: Add CLI subcommands**
+
+Replace the current `Cli` shape in `src/main.rs` with a `Run` and `Doctor` subcommand:
+
+```rust
+#[derive(Debug, Parser)]
+#[command(name = "telellm")]
+#[command(about = "Telegram group chat bridge for sandboxed Codex CLI sessions")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    Run {
+        #[arg(long, default_value = "config.toml")]
+        config: std::path::PathBuf,
+    },
+    Doctor {
+        #[arg(long, default_value = "config.toml")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        create_network: bool,
+    },
+}
+```
+
+In `main`, treat no subcommand as `Run` for backwards compatibility.
+
+- [ ] **Step 3: Implement doctor checks**
+
+Create `src/doctor.rs` with checks for:
+
+- config file parses and validates;
+- Telegram token env var exists;
+- upstream API key env var exists;
+- Docker CLI is reachable with `docker version`;
+- sandbox image exists with `docker image inspect`;
+- configured Docker network exists with `docker network inspect`;
+- when `--create-network` is set, missing network is created with `docker network create`;
+- sandbox image can run `codex --version` on the configured network.
+
+Return a typed `DoctorReport` with `checks: Vec<DoctorCheck>`, where each check has `name`, `status`, and `detail`.
+
+- [ ] **Step 4: Add failing tests**
+
+Add tests in `src/doctor.rs` for pure command construction:
+
+```rust
+#[test]
+fn docker_network_create_args_should_use_configured_network() {
+    assert_eq!(
+        docker_network_create_args("telellm_public"),
+        vec!["network", "create", "telellm_public"]
+    );
+}
+
+#[test]
+fn codex_version_probe_args_should_use_configured_image_and_network() {
+    let args = codex_version_probe_args("telellm-sandbox:local", "telellm_public");
+
+    assert!(args.windows(2).any(|window| window == ["--network", "telellm_public"]));
+    assert!(args.contains(&"telellm-sandbox:local".to_owned()));
+    assert!(args.ends_with(&["codex".to_owned(), "--version".to_owned()]));
+}
+```
+
+- [ ] **Step 5: Update README setup**
+
+Add setup commands:
+
+```bash
+docker network create telellm_public
+docker build -f Dockerfile.sandbox -t telellm-sandbox:local .
+cargo run -- doctor --config config.toml
+cargo run -- doctor --config config.toml --create-network
+```
+
+Explain that `telellm_public` must exist before the daemon starts because `config.example.toml` references it.
+
+- [ ] **Step 6: Run validation**
+
+Run:
+
+```bash
+cargo test doctor::
+cargo run -- doctor --config config.example.toml
+./scripts/check.sh
+```
+
+Expected: doctor unit tests pass; doctor reports missing env vars for example config instead of panicking; full checks pass.
+
+- [ ] **Step 7: Commit**
+
+Run:
+
+```bash
+git add src/doctor.rs src/lib.rs src/main.rs README.md
+git commit -m "feat: add setup doctor"
+```
+
+---
+
+### Task 19: Add Telegram Group Allowlist And First-Run Docs
+
+**Files:**
+- Modify: `src/config.rs`
+- Modify: `src/app.rs`
+- Modify: `config.example.toml`
+- Modify: `README.md`
+- Test: `src/config.rs`
+- Test: `src/app.rs`
+
+- [ ] **Step 1: Add allowed chat IDs to config**
+
+Extend `TelegramConfig`:
+
+```rust
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramConfig {
+    pub bot_token_env: String,
+    pub bot_username: String,
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<crate::ids::ChatId>,
+}
+```
+
+If `ChatId` does not implement `Deserialize`, derive it in `src/ids.rs`.
+
+- [ ] **Step 2: Reject disallowed chats before runtime startup**
+
+In `AppCore::handle_message`, after pushing to the rolling buffer and parsing the command, return early when the allowlist is non-empty and `message.chat_id` is not allowed. The early return must happen before `self.runtime.ensure_chat_runtime(...)`.
+
+- [ ] **Step 3: Add tests**
+
+Add config test:
+
+```rust
+#[test]
+fn from_toml_str_should_parse_allowed_chat_ids() {
+    let raw = valid_config().replace(
+        "bot_username = \"telellm_bot\"",
+        "bot_username = \"telellm_bot\"\nallowed_chat_ids = [-10012345, 42]",
+    );
+
+    let config = AppConfig::from_toml_str(&raw).expect("config should parse");
+
+    assert_eq!(config.telegram.allowed_chat_ids, vec![ChatId(-10012345), ChatId(42)]);
+}
+```
+
+Add app test:
+
+```rust
+#[tokio::test]
+async fn handle_message_should_ignore_disallowed_chat_without_runtime() {
+    let (app, runtime, _messages) = app_with_fakes_and_allowed_chats(vec![ChatId(999)]).await;
+
+    app.handle_message(incoming("@telellm_bot hello"))
+        .await
+        .expect("disallowed chat should be ignored");
+
+    assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+}
+```
+
+- [ ] **Step 4: Update example config and README**
+
+Add to `config.example.toml`:
+
+```toml
+allowed_chat_ids = []
+```
+
+Document:
+
+- Create the bot with BotFather.
+- Disable Telegram group privacy if ambient catch-up is desired.
+- Add the bot to a test group first.
+- Set `allowed_chat_ids` before exposing the bot broadly.
+- Use Telegram `getUpdates` or bot logs to discover a group chat ID.
+
+- [ ] **Step 5: Run validation**
+
+Run:
+
+```bash
+cargo test config::tests::from_toml_str_should_parse_allowed_chat_ids
+cargo test app::tests::handle_message_should_ignore_disallowed_chat_without_runtime
+./scripts/check.sh
+```
+
+Expected: all pass.
+
+- [ ] **Step 6: Commit**
+
+Run:
+
+```bash
+git add src/config.rs src/ids.rs src/app.rs config.example.toml README.md
+git commit -m "feat: add Telegram chat allowlist"
+```
+
+---
+
+### Task 20: Make Control Commands Local And User-Visible
+
+**Files:**
+- Modify: `src/app.rs`
+- Modify: `src/bot/telegram.rs` only if the sink boundary needs a helper
+- Test: `src/app.rs`
+
+- [ ] **Step 1: Split command handling by local vs Codex-backed commands**
+
+Change `/help`, `/status`, `/memory`, `/forget`, and confirmation messages to use `TelegramSink::send_message` directly instead of `router.enqueue(...)`.
+
+Keep runtime startup only for commands that require a running sandbox/Codex session:
+
+- addressed free-form prompts;
+- `/reset`;
+- `/restart`;
+- `/rebuild`;
+
+- [ ] **Step 2: Add direct reply helper**
+
+Add this helper to `AppCore`:
+
+```rust
+async fn reply_text(
+    &self,
+    chat_id: crate::ids::ChatId,
+    text: impl AsRef<str>,
+) -> Result<(), AppError> {
+    self.router.telegram().send_message(chat_id, text.as_ref()).await?;
+    Ok(())
+}
+```
+
+If `Router` does not expose its sink, add:
+
+```rust
+pub fn telegram(&self) -> Arc<T> {
+    self.telegram.clone()
+}
+```
+
+- [ ] **Step 3: Add tests**
+
+Add:
+
+```rust
+#[tokio::test]
+async fn help_should_reply_without_runtime() {
+    let (app, runtime, mut messages) = app_with_fakes().await;
+
+    app.handle_message(incoming("/help")).await.expect("help should reply");
+
+    assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    assert!(messages.recv().await.expect("reply").contains("/status"));
+}
+
+#[tokio::test]
+async fn forget_all_should_not_start_codex() {
+    let (app, runtime, mut messages) = app_with_fakes().await;
+
+    app.handle_message(incoming("/forget all")).await.expect("forget should reply");
+
+    assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    assert!(messages.recv().await.expect("reply").contains("Forgot"));
+}
+```
+
+- [ ] **Step 4: Surface runtime failures to chat**
+
+In `IncomingMessageHandler for AppCore`, send a safe error message on `Runtime` and `Router` errors:
+
+```rust
+let text = format!("I could not start this group's Codex runtime: {err}");
+```
+
+Do not include tokens, config values, raw env vars, or full command lines.
+
+- [ ] **Step 5: Add runtime failure test**
+
+Add:
+
+```rust
+#[tokio::test]
+async fn runtime_start_failure_should_send_telegram_error() {
+    let (app, _runtime, mut messages) = app_with_failing_runtime().await;
+
+    IncomingMessageHandler::handle_message(&app, incoming("@telellm_bot hello")).await;
+
+    assert!(messages.recv().await.expect("reply").contains("could not start"));
+}
+```
+
+- [ ] **Step 6: Run validation**
+
+Run:
+
+```bash
+cargo test app::tests::help_should_reply_without_runtime
+cargo test app::tests::forget_all_should_not_start_codex
+cargo test app::tests::runtime_start_failure_should_send_telegram_error
+./scripts/check.sh
+```
+
+Expected: all pass.
+
+- [ ] **Step 7: Commit**
+
+Run:
+
+```bash
+git add src/app.rs src/router.rs src/bot/telegram.rs
+git commit -m "feat: handle control commands locally"
+```
+
+---
+
+### Task 21: Add Runtime Status, Generations, And Lifecycle Serialization
+
+**Files:**
+- Modify: `src/runtime.rs`
+- Modify: `src/router.rs`
+- Modify: `src/app.rs`
+- Test: `src/runtime.rs`
+- Test: `src/router.rs`
+- Test: `src/app.rs`
+
+- [ ] **Step 1: Define runtime status**
+
+Add:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatRuntimeStatus {
+    pub chat_id: ChatId,
+    pub state: RuntimeState,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeState {
+    NotStarted,
+    Starting,
+    Ready,
+    Degraded(String),
+}
+```
+
+Add `async fn chat_status(&self, chat_id: ChatId) -> ChatRuntimeStatus` to `RuntimeControl`.
+
+- [ ] **Step 2: Serialize all lifecycle operations**
+
+Reuse the per-chat lifecycle lock for `ensure`, `reset`, `restart`, and `rebuild`, not only cold starts. Increment the generation every time a session is replaced.
+
+- [ ] **Step 3: Make router workers generation-aware**
+
+Store the generation with registered sessions. When a new session is registered, old workers must stop processing stale queued work or mark it stale instead of sending responses from the old session after a reset.
+
+- [ ] **Step 4: Add tests**
+
+Add these tests with the named behavior:
+
+- `runtime::tests::restart_should_wait_for_in_flight_start_for_same_chat`: use two `Notify` gates like `ensure_unregistered_chat_runtime_should_serialize_same_chat_cold_start`; start an `ensure`, call `restart` for the same chat, assert restart does not enter until the first lifecycle operation releases.
+- `router::tests::register_session_should_not_send_stale_generation_after_replacement`: enqueue slow work against generation 1, register generation 2 before the slow work returns, then assert Telegram receives only generation 2 output.
+- `app::tests::status_should_report_degraded_runtime_without_codex_prompt`: configure fake runtime status as `Degraded("docker unavailable")`, send `/status`, assert the Telegram reply includes `degraded` and fake Codex session receives no prompt.
+
+- [ ] **Step 5: Run validation**
+
+Run:
+
+```bash
+cargo test runtime::tests::restart_should_wait_for_in_flight_start_for_same_chat
+cargo test router::tests::register_session_should_not_send_stale_generation_after_replacement
+cargo test app::tests::status_should_report_degraded_runtime_without_codex_prompt
+./scripts/check.sh
+```
+
+Expected: all pass.
+
+- [ ] **Step 6: Commit**
+
+Run:
+
+```bash
+git add src/runtime.rs src/router.rs src/app.rs
+git commit -m "feat: track chat runtime status"
+```
+
+---
+
+### Task 22: Wire PTY Read Policy To Config And Add Codex Smoke Test
+
+**Files:**
+- Modify: `src/config.rs`
+- Modify: `config.example.toml`
+- Modify: `src/runtime.rs`
+- Modify: `src/codex/pty.rs`
+- Create: `tests/codex_sandbox_smoke.rs`
+- Test: `src/config.rs`
+- Test: `src/runtime.rs`
+- Test: `tests/codex_sandbox_smoke.rs`
+
+- [ ] **Step 1: Add explicit PTY limits to config**
+
+Extend `LimitsConfig`:
+
+```rust
+#[serde(default = "default_codex_first_byte_timeout_secs")]
+pub codex_first_byte_timeout_secs: u64,
+#[serde(default = "default_codex_max_turn_secs")]
+pub codex_max_turn_secs: u64,
+#[serde(default = "default_codex_max_output_bytes")]
+pub codex_max_output_bytes: usize,
+```
+
+Validate all are greater than zero.
+
+- [ ] **Step 2: Construct `PtyReadPolicy` from config**
+
+Add:
+
+```rust
+pub fn codex_read_policy(config: &AppConfig) -> crate::codex::pty::PtyReadPolicy {
+    crate::codex::pty::PtyReadPolicy {
+        first_byte_timeout: Duration::from_secs(config.limits.codex_first_byte_timeout_secs),
+        inactivity_timeout: Duration::from_secs(config.limits.codex_inactivity_secs),
+        max_turn_timeout: Duration::from_secs(config.limits.codex_max_turn_secs),
+        max_output_bytes: config.limits.codex_max_output_bytes,
+    }
+}
+```
+
+Use `PtyCodexSession::spawn_with_read_policy` in `RuntimeManager`.
+
+- [ ] **Step 3: Add tests**
+
+Add these tests with the named behavior:
+
+- `config::tests::from_toml_str_should_reject_zero_codex_inactivity_secs`: replace `codex_inactivity_secs = 600` with `codex_inactivity_secs = 0`, parse config, and assert the error string names `limits.codex_inactivity_secs`.
+- `config::tests::codex_read_policy_should_use_configured_limits`: add explicit limit values to the valid test config and assert `first_byte_timeout`, `inactivity_timeout`, `max_turn_timeout`, and `max_output_bytes`.
+- `runtime::tests::codex_session_should_use_configured_inactivity_timeout`: construct a runtime manager with test config limits and assert the policy passed to PTY construction matches those values through a test-only policy builder.
+
+- [ ] **Step 4: Add ignored live Codex sandbox smoke test**
+
+Create `tests/codex_sandbox_smoke.rs`:
+
+```rust
+#[test]
+#[ignore = "requires Docker/Colima, telellm-sandbox:local, broker setup, and OPENAI_API_KEY"]
+fn codex_sandbox_should_report_version() {
+    let output = std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--cap-add",
+            "NET_ADMIN",
+            "telellm-sandbox:local",
+            "codex",
+            "--version",
+        ])
+        .output()
+        .expect("docker should run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+```
+
+- [ ] **Step 5: Run validation**
+
+Run:
+
+```bash
+cargo test config::tests::codex_read_policy_should_use_configured_limits
+cargo test --test codex_sandbox_smoke -- --ignored
+./scripts/check.sh
+```
+
+Expected: focused tests and full checks pass; smoke test passes when Docker image is available.
+
+- [ ] **Step 6: Commit**
+
+Run:
+
+```bash
+git add src/config.rs config.example.toml src/runtime.rs src/codex/pty.rs tests/codex_sandbox_smoke.rs
+git commit -m "feat: configure Codex PTY limits"
+```
+
+---
+
+### Task 23: Scope Broker Tokens And Add Broker Limits
+
+**Files:**
+- Modify: `src/broker.rs`
+- Modify: `src/sandbox/mod.rs`
+- Modify: `src/runtime.rs`
+- Modify: `src/config.rs`
+- Test: `src/broker.rs`
+- Test: `src/runtime.rs`
+
+- [ ] **Step 1: Replace static token with generated per-chat token**
+
+Introduce a `BrokerToken` type:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BrokerToken(String);
+```
+
+Generate one token per chat runtime using a cryptographically random source. If adding `rand` is needed, run:
+
+```bash
+cargo add rand
+```
+
+- [ ] **Step 2: Register active tokens in broker state**
+
+`BrokerState` should track active tokens and owning chat IDs:
+
+```rust
+active_tokens: tokio::sync::RwLock<std::collections::HashMap<String, ChatId>>,
+```
+
+The broker must reject:
+
+- missing tokens;
+- unknown tokens;
+- stale tokens after rotation;
+- tokens that exceed configured rate/concurrency limits.
+
+- [ ] **Step 3: Rotate tokens on reset and rebuild**
+
+When a runtime is rebuilt or reset with workspace clear, generate a fresh token, update the sandbox spec, and invalidate the old token in broker state.
+
+- [ ] **Step 4: Add tests**
+
+Add these tests with the named behavior:
+
+- `broker::tests::router_should_reject_token_for_another_chat`: register two chat tokens, send a request with chat A route metadata and chat B token, assert `401 Unauthorized` or `403 Forbidden` depending on the chosen API.
+- `broker::tests::router_should_reject_stale_token_after_rotation`: register a token, rotate it, send with the old token, and assert the upstream fake server receives no request.
+- `broker::tests::router_should_rate_limit_sandbox_requests`: configure a one-request window, send two valid requests, assert the second response is `429 Too Many Requests`.
+- `runtime::tests::spec_for_chat_should_use_unique_broker_token`: build specs for two chat IDs and assert their `broker_token` values differ and are non-empty.
+
+- [ ] **Step 5: Run validation**
+
+Run:
+
+```bash
+cargo test broker::tests::router_should_reject_stale_token_after_rotation
+cargo test broker::tests::router_should_rate_limit_sandbox_requests
+cargo test runtime::tests::spec_for_chat_should_use_unique_broker_token
+./scripts/check.sh
+```
+
+Expected: all pass.
+
+- [ ] **Step 6: Commit**
+
+Run:
+
+```bash
+git add Cargo.toml Cargo.lock src/broker.rs src/sandbox/mod.rs src/runtime.rs src/config.rs
+git commit -m "feat: scope broker tokens per chat"
+```
+
+---
+
+### Task 24: Add Host-Managed Memory Write Path
+
+**Files:**
+- Modify: `src/bot/command.rs`
+- Modify: `src/app.rs`
+- Modify: `README.md`
+- Test: `src/bot/command.rs`
+- Test: `src/app.rs`
+
+- [ ] **Step 1: Add `/remember` command**
+
+Extend `BotCommand`:
+
+```rust
+Remember { content: String },
+```
+
+Parse `/remember <fact>` and reject empty input with `CommandParseError::MissingArgument("/remember")`.
+
+- [ ] **Step 2: Write memory directly on the host**
+
+Handle `/remember` in `AppCore::handle_command` by calling:
+
+```rust
+self.memory_store
+    .add_memory(message.chat_id, message.from, MemoryKind::Personality, &content)
+    .await?;
+```
+
+Reply directly to Telegram with `Remembered that for this group.` Do not start Codex for `/remember`.
+
+- [ ] **Step 3: Add tests**
+
+Add:
+
+```rust
+#[test]
+fn parse_should_capture_remember() {
+    let parsed = BotCommand::parse("/remember Mike likes short answers", "telellm_bot")
+        .expect("parse should succeed");
+
+    assert_eq!(
+        parsed,
+        Some(BotCommand::Remember {
+            content: "Mike likes short answers".to_owned()
+        })
+    );
+}
+
+#[tokio::test]
+async fn remember_should_write_memory_without_runtime() {
+    let (app, runtime, mut messages) = app_with_fakes().await;
+
+    app.handle_message(incoming("/remember Mike likes short answers"))
+        .await
+        .expect("remember should work");
+
+    assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    assert!(messages.recv().await.expect("reply").contains("Remembered"));
+}
+```
+
+- [ ] **Step 4: Update README**
+
+Document:
+
+```text
+/remember <fact> stores a host-managed group memory record. The sandbox can see remembered facts as prompt context, but cannot directly edit the host memory database.
+```
+
+- [ ] **Step 5: Run validation**
+
+Run:
+
+```bash
+cargo test bot::command::tests::parse_should_capture_remember
+cargo test app::tests::remember_should_write_memory_without_runtime
+./scripts/check.sh
+```
+
+Expected: all pass.
+
+- [ ] **Step 6: Commit**
+
+Run:
+
+```bash
+git add src/bot/command.rs src/app.rs README.md
+git commit -m "feat: add group remember command"
+```
+
+---
+
+### Task 25: Add Queue/Busy Feedback And Telegram Retry Handling
+
+**Files:**
+- Modify: `src/router.rs`
+- Modify: `src/app.rs`
+- Modify: `src/bot/telegram.rs`
+- Test: `src/router.rs`
+- Test: `src/app.rs`
+- Test: `src/bot/telegram.rs`
+
+- [ ] **Step 1: Return queue position from router enqueue**
+
+Change `Router::enqueue` to return:
+
+```rust
+pub struct EnqueueReceipt {
+    pub chat_id: ChatId,
+    pub queue_position: usize,
+}
+```
+
+Use `mpsc::Sender::capacity()` and configured queue depth to estimate position before enqueueing.
+
+- [ ] **Step 2: Send busy acknowledgement for queued work**
+
+When `queue_position > 0`, `AppCore` should send a short direct Telegram acknowledgement such as:
+
+```text
+Queued behind 2 existing request(s).
+```
+
+- [ ] **Step 3: Add Telegram retry-after handling**
+
+In `TeloxideTelegramSink`, detect Telegram retry-after/rate-limit errors when teloxide exposes them. Sleep for the requested duration plus a small buffer, then retry once. If teloxide does not expose structured retry-after for the current error type, add a narrow helper that can be unit tested with a synthetic error string and document the limitation.
+
+- [ ] **Step 4: Add tests**
+
+Add these tests with the named behavior:
+
+- `router::tests::enqueue_should_report_queue_position_when_busy`: use a slow fake session, enqueue two requests for one chat, and assert the second receipt has `queue_position == 1`.
+- `app::tests::addressed_message_should_acknowledge_long_running_turn`: send two addressed messages while the first fake Codex turn is blocked, assert Telegram receives a queued acknowledgement for the second message.
+- `bot::telegram::tests::retry_after_parser_should_extract_seconds`: pass a synthetic Telegram error string containing `retry after 7`, assert the helper returns `Some(Duration::from_secs(7))`.
+
+- [ ] **Step 5: Run validation**
+
+Run:
+
+```bash
+cargo test router::tests::enqueue_should_report_queue_position_when_busy
+cargo test app::tests::addressed_message_should_acknowledge_long_running_turn
+cargo test bot::telegram::tests::retry_after_parser_should_extract_seconds
+./scripts/check.sh
+```
+
+Expected: all pass.
+
+- [ ] **Step 6: Commit**
+
+Run:
+
+```bash
+git add src/router.rs src/app.rs src/bot/telegram.rs
+git commit -m "feat: report queue state to Telegram"
+```
+
+---
+
 ## Known Risk Items To Resolve During Execution
 
-- `portable-pty` restart is modeled as replacing a session object in the router. Keep that ownership boundary instead of mutating PTY reader and writer handles in place.
+- Broker auth is still a static global sandbox token after Task 17. Task 23 must replace it with per-chat scoped, revocable tokens and rate limits before broad real-world use.
+- Runtime lifecycle replacement still needs generation-aware cancellation. Task 21 must prevent stale workers or queued work from old sessions from responding after reset/restart/rebuild.
+- `codex.env` is parsed but not propagated. Decide during Task 22 or Task 23 whether to remove it or explicitly constrain and pass only safe values.
 - The Dockerfile includes the current official Codex npm install path. If the Linux container package resolution changes, use the Linux release binary from the official `openai/codex` releases instead.
-- The initial network policy blocks local CIDRs with container-local `iptables`. On Colima, verify that this blocks host gateway paths in practice. If it does not, add host-side Colima or Docker network firewall rules before considering the sandbox security complete.
-- App startup wires polling after the core modules pass tests. Keep local pure-logic tests fast so Telegram failures are isolated to adapter-level checks.
+- Host-gateway and Colima bridge probing is still narrower than the design goal. Task 18 and Task 22 should keep live Docker checks cheap enough to run before real group deployment.
