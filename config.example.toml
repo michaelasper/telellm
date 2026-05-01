@@ -30,3 +30,6 @@ codex_first_byte_timeout_secs = 300
 codex_inactivity_secs = 600
 codex_max_turn_secs = 900
 codex_max_output_bytes = 524288
+broker_max_requests_per_window = 120
+broker_rate_limit_window_secs = 60
+broker_max_concurrent_requests = 4

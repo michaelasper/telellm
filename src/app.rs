@@ -34,11 +34,14 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                 config.broker.upstream_api_key_env
             )
         })?;
-    let broker_state = crate::broker::BrokerState::new(crate::broker::BrokerConfig {
-        listen: config.broker.listen,
-        upstream_base_url: config.broker.upstream_base_url.clone(),
-        upstream_api_key: secrecy::SecretString::from(upstream_api_key),
-    });
+    let broker_state = crate::broker::BrokerState::new_with_limits(
+        crate::broker::BrokerConfig {
+            listen: config.broker.listen,
+            upstream_base_url: config.broker.upstream_base_url.clone(),
+            upstream_api_key: secrecy::SecretString::from(upstream_api_key),
+        },
+        crate::config::broker_limits(&config),
+    );
     let broker_listener = tokio::net::TcpListener::bind(config.broker.listen)
         .await
         .with_context(|| format!("failed to bind broker at {}", config.broker.listen))?;

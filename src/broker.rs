@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 const CHAT_ID_HEADER: &str = "x-telellm-chat-id";
 const GENERATED_TOKEN_BYTES: usize = 32;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct BrokerToken(String);
 
 impl BrokerToken {
@@ -48,6 +48,12 @@ impl From<&str> for BrokerToken {
 impl fmt::Display for BrokerToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for BrokerToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BrokerToken(<redacted>)")
     }
 }
 
@@ -269,9 +275,7 @@ async fn authorize_sandbox_request(
         )
             .into_response()
     })?;
-    let chat_id = chat_id_metadata(headers).ok_or_else(|| {
-        (StatusCode::FORBIDDEN, "missing or invalid chat metadata").into_response()
-    })?;
+    let chat_id = chat_id_metadata(headers);
     let owner = state
         .token_registry
         .owner_for_token(&token)
@@ -283,7 +287,7 @@ async fn authorize_sandbox_request(
             )
                 .into_response()
         })?;
-    if owner != chat_id {
+    if chat_id.is_some_and(|chat_id| owner != chat_id) {
         return Err((StatusCode::FORBIDDEN, "sandbox token is not scoped to chat").into_response());
     }
 
@@ -763,5 +767,67 @@ mod tests {
         let upstream_request = upstream_task.await.expect("upstream task should complete");
         assert!(upstream_request.starts_with("POST /v1/responses HTTP/1.1"));
         assert!(upstream_request.contains("authorization: Bearer test-key"));
+    }
+
+    #[tokio::test]
+    async fn router_should_accept_valid_token_without_chat_metadata() {
+        let upstream = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let upstream_addr = upstream
+            .local_addr()
+            .expect("upstream listener should have local addr");
+
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream
+                .accept()
+                .await
+                .expect("upstream should receive request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let bytes_read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("upstream request should be readable");
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: application/json\r\n\r\n{}",
+                )
+                .await
+                .expect("upstream response should write");
+        });
+
+        let token = BrokerToken::from("test-chat-token");
+        let app = registered_app_for_upstream(
+            format!("http://{upstream_addr}/v1"),
+            ChatId(1),
+            token.clone(),
+        )
+        .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("authorization", bearer(&token))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        upstream_task.await.expect("upstream task should complete");
     }
 }
