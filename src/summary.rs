@@ -48,7 +48,7 @@ pub fn build_summary_prompt(
 }
 
 fn is_summary_command_text(text: &str) -> bool {
-    let Some(first_token) = text.trim().split_whitespace().next() else {
+    let Some(first_token) = text.split_whitespace().next() else {
         return false;
     };
     if !first_token.starts_with('/') {
