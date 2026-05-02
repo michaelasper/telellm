@@ -385,7 +385,7 @@ where
     }
 
     async fn prepare_audio(&self, message: &mut IncomingMessage) -> Result<(), AppError> {
-        let mut has_usable_context = message_has_text(message);
+        let mut has_usable_context = !message.text.trim().is_empty();
         let mut first_audio_failure = None;
         self.prepare_audio_attachment_list(
             message.chat_id,
@@ -699,14 +699,6 @@ where
         }
         Ok(())
     }
-}
-
-fn message_has_text(message: &IncomingMessage) -> bool {
-    !message.text.trim().is_empty()
-        || message
-            .reply_to
-            .as_ref()
-            .is_some_and(|reply_to| !reply_to.text.trim().is_empty())
 }
 
 fn handle_skipped_audio(
@@ -1262,6 +1254,29 @@ mod tests {
             app_with_fakes_and_audio_stt_failure(false).await;
 
         IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_only_reply_context_stt_failure_should_send_audio_error_without_codex_prompt() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_fakes_and_audio_stt_failure(false).await;
+        let mut message = incoming_voice("", 15);
+        message.reply_to = Some(crate::bot::message::RepliedMessage {
+            message_id: MessageId(7),
+            from_name: Some("Mike".to_owned()),
+            text: "here is the context I am replying to".to_owned(),
+            attachments: Vec::new(),
+            context_notes: Vec::new(),
+        });
+
+        IncomingMessageHandler::handle_message(&app, message).await;
 
         let reply = messages.recv().await.expect("audio error should be sent");
         assert_eq!(
