@@ -13,7 +13,8 @@ On startup, `telellm` registers this command list with Telegram so clients can s
 | Slash commands | Parsed by command name. |
 | Mention of `@bot_username` | Enqueued as an addressed Codex prompt. |
 | Reply to a bot message | Enqueued as an addressed Codex prompt. |
-| Photo, document, voice, or audio with caption, in a DM, or in the replied-to message | Downloaded into the chat workspace when addressed. |
+| Photo, document, voice, or audio with caption, in a DM, or in the replied-to message | Downloaded into the chat workspace when addressed. Voice and audio attachments are also transcribed when STT is available. |
+| HTTP or HTTPS URL in addressed text | Fetched into a bounded workspace snapshot when URL ingestion is enabled. |
 | Generated file reference in Codex response | Files under `outputs.workspace_dir` are sent as Telegram documents when the final response mentions them as `@...` paths. |
 | Plain ambient group message | Stored only in the in-memory recent buffer when Telegram delivers it. |
 
@@ -29,8 +30,28 @@ On startup, `telellm` registers this command list with Telegram so clients can s
 | `/memory` | none | Replies with durable memory records for the group. |
 | `/remember` | text | Stores the text as a durable `personality` memory for the group. |
 | `/forget` | `all` or text | `all` deletes all durable memory records for the group. Text targets are acknowledged but not currently deleted. |
-| `/voice` | `on`, `off`, or `status` | Manages spoken replies for the group. With no argument, reports audio daemon status, spoken-reply daemon status, and this chat's voice mode. |
+| `/voice` | `on`, `off`, or `status` | Manages spoken replies for the group. With no argument, behaves like `/voice status`. |
 | `/summarize` | optional focus text | Queues a stateless Codex prompt for a catch-up recap of recent in-memory chat, optionally focused on a topic. Does not write durable memory. |
+
+## Voice Commands
+
+`/voice status` is the authoritative runtime availability check for this milestone and does not start Codex. It reports:
+
+```text
+Audio: enabled. Spoken replies: enabled. Chat voice mode: on. STT: available. TTS: available.
+```
+
+`Audio` reflects `[audio].enabled`. `Spoken replies` reflects `[audio].replies_enabled`. `Chat voice mode` is this chat's persisted spoken-reply setting. `STT` and `TTS` are available only when the corresponding local command subsection is configured.
+
+`/voice off` suppresses spoken replies for this chat. `/voice on` re-enables them unless spoken replies are disabled globally by the daemon operator.
+
+Voice/audio-triggered Codex turns always send the final text response first. If global audio, global spoken replies, this chat's voice mode, and TTS availability all permit it, the bot then sends a synthesized spoken reply. TTS failures are logged and do not alter the text response.
+
+## Summaries
+
+`/summarize` builds a catch-up recap prompt from the recent in-memory rolling chat for that group. `/summarize <topic>` adds a focus line to the prompt.
+
+The summary turn is queued like any other Codex turn, but it is stateless with respect to durable memory: it reads recent rolling chat and writes no durable memory records.
 
 ## Runtime Status Values
 

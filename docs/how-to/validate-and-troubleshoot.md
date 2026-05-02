@@ -27,6 +27,31 @@ To create a missing configured Docker network, run:
 cargo run -- doctor --config config.toml --create-network
 ```
 
+## Check Local Audio Tools
+
+If `[audio.stt]` or `[audio.tts]` is configured, the daemon will run those commands on the host. Check that they are available:
+
+```bash
+whisper-cli --help
+piper --help
+```
+
+Then check the configured daemon setup:
+
+```bash
+cargo run -- doctor --config config.toml
+```
+
+The doctor validates config, secrets, Docker, the sandbox image, the Docker network, and Codex probes. It does not prove that Telegram can reach the bot or that a particular chat has spoken replies enabled.
+
+In Telegram, use:
+
+```text
+/voice status
+```
+
+`/voice status` is the authoritative runtime availability check for this milestone. It reports global audio, global spoken replies, the chat's voice mode, STT availability, and TTS availability without starting Codex.
+
 ## Build A Missing Sandbox Image
 
 If the doctor reports that the sandbox image is not inspectable, build it:
@@ -110,4 +135,4 @@ If slash commands such as `/remember` do not appear in the Telegram command menu
 
 ## Known Doctor Limits
 
-The doctor does not currently verify Telegram API reachability, SQLite write permissions, or that the bot is present in a specific group.
+The doctor does not currently verify Telegram API reachability, SQLite write permissions, local STT/TTS command execution, `/voice status`, or that the bot is present in a specific group.
