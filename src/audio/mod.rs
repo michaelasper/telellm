@@ -19,6 +19,7 @@ use tokio::{
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 20_000_000;
 const STDERR_TAIL_BYTES: usize = 4096;
 const STDERR_DRAIN_AFTER_REAP: Duration = Duration::from_millis(100);
+const CHILD_REAP_AFTER_STDIN_ERROR: Duration = Duration::from_millis(100);
 static TEMP_AUDIO_REPLY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,7 +298,28 @@ async fn run_audio_command(
     .await;
 
     let status = match command_result {
-        Ok(result) => result?,
+        Ok(Ok(status)) => status,
+        Ok(Err(err)) => {
+            let status =
+                match tokio::time::timeout(CHILD_REAP_AFTER_STDIN_ERROR, child.wait()).await {
+                    Ok(status) => status,
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        child.wait().await
+                    }
+                };
+            let stderr = collect_stderr_after_reap(stderr_task).await;
+            match status {
+                Ok(status) if !status.success() => {
+                    return Err(AudioError::Exit {
+                        command: command.to_owned(),
+                        status: status.to_string(),
+                        stderr,
+                    });
+                }
+                Ok(_) | Err(_) => return Err(err),
+            }
+        }
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -507,6 +529,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn tts_command_that_exits_before_reading_stdin_should_report_exit() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("reply.ogg");
+        let runner = LocalTts::new(AudioTtsConfig {
+            command: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf early-exit >&2; exit 7".to_owned(),
+                "test-sh".to_owned(),
+                "{output}".to_owned(),
+            ],
+            stdin_text: true,
+            timeout_secs: 5,
+            send_as: AudioSendAs::Voice,
+        });
+        let text = "x".repeat(4 * 1024 * 1024);
+
+        let err = runner
+            .synthesize_to(&text, &output)
+            .await
+            .expect_err("early command exit should fail");
+
+        let AudioError::Exit { stderr, .. } = err else {
+            panic!("expected exit error");
+        };
+        assert!(stderr.contains("early-exit"), "{stderr}");
     }
 
     #[tokio::test]

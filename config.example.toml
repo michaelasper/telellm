@@ -48,7 +48,7 @@ command = "piper"
 args = ["--model", "/models/en_US-lessac-medium.onnx", "--output_file", "{output}"]
 stdin_text = true
 timeout_secs = 120
-send_as = "voice"
+send_as = "audio"
 
 [url_ingestion]
 enabled = true

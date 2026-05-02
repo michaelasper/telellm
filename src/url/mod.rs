@@ -447,6 +447,7 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
     ![
         (Ipv6Addr::UNSPECIFIED, 128),
         (Ipv6Addr::LOCALHOST, 128),
+        (Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0), 96),
         (Ipv6Addr::new(0x0064, 0xff9b, 0x0001, 0, 0, 0, 0, 0), 48),
         (Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64),
         (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
@@ -555,6 +556,7 @@ mod tests {
             "198.51.100.1",
             "203.0.113.1",
             "255.255.255.255",
+            "64:ff9b::1",
             "2001:db8::1",
             "3fff::1",
         ] {
