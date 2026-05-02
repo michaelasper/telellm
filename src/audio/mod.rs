@@ -9,7 +9,13 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
+
+const DEFAULT_MAX_OUTPUT_BYTES: u64 = 25 * 1024 * 1024;
+const STDERR_TAIL_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcript {
@@ -27,11 +33,13 @@ pub struct SynthesizedAudio {
 #[derive(Debug, Clone)]
 pub struct LocalStt {
     config: AudioToolConfig,
+    max_output_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct LocalTts {
     config: AudioTtsConfig,
+    max_output_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +77,14 @@ pub enum AudioError {
 
 impl LocalStt {
     pub fn new(config: AudioToolConfig) -> Self {
-        Self { config }
+        Self::new_with_max_output_bytes(config, DEFAULT_MAX_OUTPUT_BYTES)
+    }
+
+    pub fn new_with_max_output_bytes(config: AudioToolConfig, max_output_bytes: u64) -> Self {
+        Self {
+            config,
+            max_output_bytes,
+        }
     }
 
     pub async fn transcribe_to(
@@ -84,6 +99,10 @@ impl LocalStt {
             self.config.timeout_secs,
         )
         .await?;
+
+        let bytes = output_len(output).await?;
+        validate_nonempty_output(bytes)?;
+        validate_output_limit(bytes, self.max_output_bytes)?;
 
         let text =
             tokio::fs::read_to_string(output)
@@ -103,7 +122,14 @@ impl LocalStt {
 
 impl LocalTts {
     pub fn new(config: AudioTtsConfig) -> Self {
-        Self { config }
+        Self::new_with_max_output_bytes(config, DEFAULT_MAX_OUTPUT_BYTES)
+    }
+
+    pub fn new_with_max_output_bytes(config: AudioTtsConfig, max_output_bytes: u64) -> Self {
+        Self {
+            config,
+            max_output_bytes,
+        }
     }
 
     pub async fn synthesize_to(
@@ -120,17 +146,9 @@ impl LocalTts {
         )
         .await?;
 
-        let metadata =
-            tokio::fs::metadata(output)
-                .await
-                .map_err(|source| AudioError::OutputRead {
-                    path: output.to_path_buf(),
-                    source,
-                })?;
-        let bytes = metadata.len();
-        if bytes == 0 {
-            return Err(AudioError::EmptyOutput);
-        }
+        let bytes = output_len(output).await?;
+        validate_nonempty_output(bytes)?;
+        validate_output_limit(bytes, self.max_output_bytes)?;
 
         Ok(SynthesizedAudio {
             host_path: output.to_path_buf(),
@@ -195,44 +213,107 @@ async fn run_audio_command(
         command: command.to_owned(),
         source,
     })?;
+    let stderr = child.stderr.take();
+    let stderr_task = tokio::spawn(read_stderr_tail(stderr));
 
-    if let Some(text) = stdin_text {
-        let mut stdin = child.stdin.take().ok_or_else(|| AudioError::Spawn {
-            command: command.to_owned(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "audio command stdin was unavailable",
-            ),
-        })?;
-        stdin
-            .write_all(text.as_bytes())
-            .await
-            .map_err(|source| AudioError::Spawn {
+    let command_result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        if let Some(text) = stdin_text {
+            let mut stdin = child.stdin.take().ok_or_else(|| AudioError::Spawn {
                 command: command.to_owned(),
-                source,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "audio command stdin was unavailable",
+                ),
             })?;
-    }
+            stdin
+                .write_all(text.as_bytes())
+                .await
+                .map_err(|source| AudioError::Spawn {
+                    command: command.to_owned(),
+                    source,
+                })?;
+        }
 
-    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-        .await
-        .map_err(|_| AudioError::Timeout {
-            command: command.to_owned(),
-            timeout_secs,
-        })?
-        .map_err(|source| AudioError::Spawn {
+        child.wait().await.map_err(|source| AudioError::Spawn {
             command: command.to_owned(),
             source,
-        })?;
+        })
+    })
+    .await;
 
-    if !output.status.success() {
+    let status = match command_result {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stderr_task.await;
+            return Err(AudioError::Timeout {
+                command: command.to_owned(),
+                timeout_secs,
+            });
+        }
+    };
+
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    if !status.success() {
         return Err(AudioError::Exit {
             command: command.to_owned(),
-            status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            status: status.to_string(),
+            stderr,
         });
     }
 
     Ok(())
+}
+
+async fn output_len(path: &Path) -> Result<u64, AudioError> {
+    tokio::fs::metadata(path)
+        .await
+        .map(|metadata| metadata.len())
+        .map_err(|source| AudioError::OutputRead {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn validate_nonempty_output(bytes: u64) -> Result<(), AudioError> {
+    if bytes == 0 {
+        return Err(AudioError::EmptyOutput);
+    }
+
+    Ok(())
+}
+
+fn validate_output_limit(bytes: u64, limit: u64) -> Result<(), AudioError> {
+    if bytes > limit {
+        return Err(AudioError::OutputTooLarge { bytes, limit });
+    }
+
+    Ok(())
+}
+
+async fn read_stderr_tail(stderr: Option<tokio::process::ChildStderr>) -> String {
+    let Some(mut stderr) = stderr else {
+        return String::new();
+    };
+    let mut tail = Vec::new();
+    let mut buffer = [0_u8; 1024];
+
+    loop {
+        let bytes_read = match stderr.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(bytes_read) => bytes_read,
+            Err(_) => break,
+        };
+        tail.extend_from_slice(&buffer[..bytes_read]);
+        if tail.len() > STDERR_TAIL_BYTES {
+            let excess = tail.len() - STDERR_TAIL_BYTES;
+            tail.drain(..excess);
+        }
+    }
+
+    String::from_utf8_lossy(&tail).trim().to_owned()
 }
 
 #[cfg(test)]
@@ -297,5 +378,146 @@ mod tests {
             b"spoken reply"
         );
         assert_eq!(speech.send_as, AudioSendAs::Voice);
+    }
+
+    #[tokio::test]
+    async fn tts_stdin_write_should_obey_command_timeout() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("reply.ogg");
+        let runner = LocalTts::new(AudioTtsConfig {
+            command: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "sleep 5".to_owned(),
+                "test-sh".to_owned(),
+                "{output}".to_owned(),
+            ],
+            stdin_text: true,
+            timeout_secs: 1,
+            send_as: AudioSendAs::Voice,
+        });
+        let text = "x".repeat(1024 * 1024);
+
+        let err = runner
+            .synthesize_to(&text, &output)
+            .await
+            .expect_err("synthesis should time out");
+
+        assert!(matches!(
+            err,
+            AudioError::Timeout {
+                timeout_secs: 1,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stt_should_reject_oversized_transcript_before_reading_text() {
+        let dir = tempdir().expect("tempdir");
+        let input = dir.path().join("input.ogg");
+        tokio::fs::write(&input, b"fake audio")
+            .await
+            .expect("write input");
+        let output = dir.path().join("transcript.txt");
+        let runner = LocalStt::new_with_max_output_bytes(
+            AudioToolConfig {
+                command: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf 'too large' > \"$2\"".to_owned(),
+                    "test-sh".to_owned(),
+                    "{input}".to_owned(),
+                    "{output}".to_owned(),
+                ],
+                timeout_secs: 5,
+            },
+            3,
+        );
+
+        let err = runner
+            .transcribe_to(&input, &output)
+            .await
+            .expect_err("oversized transcript should be rejected");
+
+        assert!(matches!(
+            err,
+            AudioError::OutputTooLarge { bytes: 9, limit: 3 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn tts_should_reject_oversized_audio_output() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("reply.ogg");
+        let runner = LocalTts::new_with_max_output_bytes(
+            AudioTtsConfig {
+                command: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf 'audio bytes' > \"$1\"".to_owned(),
+                    "test-sh".to_owned(),
+                    "{output}".to_owned(),
+                ],
+                stdin_text: false,
+                timeout_secs: 5,
+                send_as: AudioSendAs::Voice,
+            },
+            5,
+        );
+
+        let err = runner
+            .synthesize_to("spoken reply", &output)
+            .await
+            .expect_err("oversized audio should be rejected");
+
+        assert!(matches!(
+            err,
+            AudioError::OutputTooLarge {
+                bytes: 11,
+                limit: 5
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn exit_error_should_keep_bounded_stderr_tail() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("reply.ogg");
+        let runner = LocalTts::new(AudioTtsConfig {
+            command: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "i=0; while [ \"$i\" -lt 9000 ]; do printf a >&2; i=$((i + 1)); done; printf tail-marker >&2; exit 7".to_owned(),
+                "test-sh".to_owned(),
+                "{output}".to_owned(),
+            ],
+            stdin_text: false,
+            timeout_secs: 5,
+            send_as: AudioSendAs::Voice,
+        });
+
+        let err = runner
+            .synthesize_to("spoken reply", &output)
+            .await
+            .expect_err("nonzero command should fail");
+
+        let AudioError::Exit { stderr, .. } = err else {
+            panic!("expected exit error");
+        };
+        assert!(stderr.len() <= 4096);
+        assert!(stderr.ends_with("tail-marker"));
+    }
+
+    #[test]
+    fn audio_send_as_should_map_to_telegram_kind() {
+        assert_eq!(
+            AudioSendAs::Voice.telegram_kind(),
+            TelegramAudioSendKind::Voice
+        );
+        assert_eq!(
+            AudioSendAs::Audio.telegram_kind(),
+            TelegramAudioSendKind::Audio
+        );
     }
 }
