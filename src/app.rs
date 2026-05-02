@@ -16,10 +16,15 @@ use async_trait::async_trait;
 use secrecy::ExposeSecret;
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     if let Some(parent) = config
@@ -380,27 +385,32 @@ where
     }
 
     async fn prepare_audio(&self, message: &mut IncomingMessage) -> Result<(), AppError> {
-        let fail_on_trigger_stt_failure = message.text.trim().is_empty();
+        let mut has_usable_context = message_has_text(message);
+        let mut first_audio_failure = None;
         self.prepare_audio_attachment_list(
             message.chat_id,
             message.message_id,
             &mut message.attachments,
             &mut message.context_notes,
-            fail_on_trigger_stt_failure,
+            &mut has_usable_context,
+            &mut first_audio_failure,
         )
-        .await?;
+        .await;
 
         if let Some(reply_to) = &mut message.reply_to {
-            let fail_on_reply_stt_failure =
-                message.text.trim().is_empty() && reply_to.text.trim().is_empty();
             self.prepare_audio_attachment_list(
                 message.chat_id,
                 reply_to.message_id,
                 &mut reply_to.attachments,
                 &mut reply_to.context_notes,
-                fail_on_reply_stt_failure,
+                &mut has_usable_context,
+                &mut first_audio_failure,
             )
-            .await?;
+            .await;
+        }
+
+        if !has_usable_context && let Some(reason) = first_audio_failure {
+            return Err(AppError::Audio(reason));
         }
 
         Ok(())
@@ -412,10 +422,11 @@ where
         message_id: crate::ids::MessageId,
         attachments: &mut [IncomingAttachment],
         context_notes: &mut Vec<String>,
-        fail_on_stt_failure: bool,
-    ) -> Result<(), AppError> {
+        has_usable_context: &mut bool,
+        first_audio_failure: &mut Option<String>,
+    ) {
         if attachments.is_empty() {
-            return Ok(());
+            return;
         }
 
         for (index, attachment) in attachments.iter_mut().enumerate() {
@@ -424,8 +435,13 @@ where
             }
 
             if !self.audio.enabled {
-                attachment.skipped_reason =
-                    Some("audio imports are disabled by configuration".to_owned());
+                handle_skipped_audio(
+                    attachment,
+                    context_notes,
+                    None,
+                    first_audio_failure,
+                    "audio imports are disabled by configuration".to_owned(),
+                );
                 continue;
             }
 
@@ -440,6 +456,7 @@ where
                             "Audio transcript from @{}: {}",
                             imported.workspace_path, transcript
                         ));
+                        *has_usable_context = true;
                     } else if let Some(reason) = imported.skipped_reason {
                         tracing::warn!(
                             chat_id = ?chat_id,
@@ -448,13 +465,13 @@ where
                             reason = %reason,
                             "failed to transcribe Telegram audio attachment"
                         );
-                        if fail_on_stt_failure {
-                            return Err(AppError::Audio(reason));
-                        }
-                        context_notes.push(format!(
-                            "Audio transcript from @{} skipped: {}",
-                            imported.workspace_path, reason
-                        ));
+                        handle_skipped_audio(
+                            attachment,
+                            context_notes,
+                            Some(&imported.workspace_path),
+                            first_audio_failure,
+                            reason,
+                        );
                     }
                 }
                 Err(reason) => {
@@ -465,12 +482,16 @@ where
                         reason = %reason,
                         "failed to import Telegram audio attachment"
                     );
-                    attachment.skipped_reason = Some(reason);
+                    handle_skipped_audio(
+                        attachment,
+                        context_notes,
+                        None,
+                        first_audio_failure,
+                        reason,
+                    );
                 }
             }
         }
-
-        Ok(())
     }
 
     async fn import_audio_attachment(
@@ -523,6 +544,8 @@ where
                     Ok(transcript) => imported.transcript = Some(transcript.text),
                     Err(err) => imported.skipped_reason = Some(err.to_string()),
                 }
+            } else {
+                imported.skipped_reason = Some("audio transcription is not configured".to_owned());
             }
 
             Ok(imported)
@@ -678,6 +701,44 @@ where
     }
 }
 
+fn message_has_text(message: &IncomingMessage) -> bool {
+    !message.text.trim().is_empty()
+        || message
+            .reply_to
+            .as_ref()
+            .is_some_and(|reply_to| !reply_to.text.trim().is_empty())
+}
+
+fn handle_skipped_audio(
+    attachment: &mut IncomingAttachment,
+    context_notes: &mut Vec<String>,
+    workspace_path: Option<&str>,
+    first_audio_failure: &mut Option<String>,
+    reason: String,
+) {
+    attachment.skipped_reason = Some(reason.clone());
+    if first_audio_failure.is_none() {
+        *first_audio_failure = Some(reason.clone());
+    }
+
+    match workspace_path {
+        Some(workspace_path) => context_notes.push(format!(
+            "Audio transcript from @{workspace_path} skipped: {reason}"
+        )),
+        None => context_notes.push(format!(
+            "Audio transcript for {} skipped: {reason}",
+            audio_attachment_label(attachment)
+        )),
+    }
+}
+
+fn audio_attachment_label(attachment: &IncomingAttachment) -> String {
+    match &attachment.file_name {
+        Some(file_name) => format!("{} `{file_name}`", attachment.kind.as_str()),
+        None => attachment.kind.as_str().to_owned(),
+    }
+}
+
 fn attachment_workspace_path(
     workspace_dir: &str,
     message_id: crate::ids::MessageId,
@@ -702,8 +763,9 @@ fn temp_attachment_path(message_id: crate::ids::MessageId, index: usize) -> Path
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "telellm-upload-{}-{}-{index}-{nanos}",
+        "telellm-upload-{}-{}-{index}-{nanos}-{counter}",
         std::process::id(),
         message_id.0
     ))
@@ -714,8 +776,9 @@ fn temp_audio_transcript_path(message_id: crate::ids::MessageId, index: usize) -
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "telellm-stt-{}-{}-{index}-{nanos}.txt",
+        "telellm-stt-{}-{}-{index}-{nanos}-{counter}.txt",
         std::process::id(),
         message_id.0
     ))
@@ -848,6 +911,20 @@ mod tests {
             reply_to: None,
             private_chat: false,
         }
+    }
+
+    fn incoming_voice(text: &str, file_size: u64) -> IncomingMessage {
+        let mut message = incoming(text);
+        message.private_chat = true;
+        message.attachments.push(IncomingAttachment::new(
+            AttachmentKind::Voice,
+            "voice-file-id".to_owned(),
+            "voice-unique-id".to_owned(),
+            Some("voice.ogg".to_owned()),
+            Some("audio/ogg".to_owned()),
+            file_size,
+        ));
+        message
     }
 
     fn test_system_prompt() -> String {
@@ -1160,15 +1237,7 @@ mod tests {
     async fn addressed_voice_should_import_transcribe_and_render_context() {
         let (app, runtime, mut messages) =
             app_with_fakes_and_audio_stt("hello from the voice note").await;
-        let mut message = incoming("@telellm_bot");
-        message.attachments.push(IncomingAttachment::new(
-            AttachmentKind::Voice,
-            "voice-file-id".to_owned(),
-            "voice-unique-id".to_owned(),
-            Some("voice.ogg".to_owned()),
-            Some("audio/ogg".to_owned()),
-            15,
-        ));
+        let message = incoming_voice("@telellm_bot", 15);
 
         app.handle_message(message)
             .await
@@ -1185,6 +1254,86 @@ mod tests {
         );
         assert!(prompt.contains("hello from the voice note"));
         assert!(prompt.contains("@telegram_audio/msg-1/1-voice.ogg"));
+    }
+
+    #[tokio::test]
+    async fn voice_only_stt_failure_should_send_audio_error_without_codex_prompt() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_fakes_and_audio_stt_failure(false).await;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn text_with_stt_failure_should_queue_with_skipped_context_note() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_fakes_and_audio_stt_failure(false).await;
+
+        app.handle_message(incoming_voice("@telellm_bot use the caption", 15))
+            .await
+            .expect("text plus failed audio should still queue");
+
+        let prompt = messages
+            .recv()
+            .await
+            .expect("Codex prompt should be echoed");
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 1);
+        assert!(prompt.contains("@telellm_bot use the caption"));
+        assert!(
+            prompt.contains("Audio transcript from @telegram_audio/msg-1/1-voice.ogg skipped:")
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_only_disabled_audio_should_send_audio_error_without_codex_prompt() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_audio_failure_config(|config| config.audio.enabled = false, false).await;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_only_oversized_audio_should_send_audio_error_without_codex_prompt() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_audio_failure_config(|config| config.audio.max_file_bytes = 10, false).await;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_only_download_failed_audio_should_send_audio_error_without_codex_prompt() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_audio_failure_config(|_| {}, true).await;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
     }
 
     async fn app_with_fakes() -> (
@@ -1254,6 +1403,66 @@ mod tests {
             runtime.clone(),
         );
         (app, runtime, messages)
+    }
+
+    async fn app_with_fakes_and_audio_stt_failure(
+        fail_download: bool,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+        Arc<FakeCodexSession>,
+    ) {
+        app_with_audio_failure_config(
+            |config| {
+                config.audio_stt = Some(Arc::new(crate::audio::LocalStt::new(
+                    crate::config::AudioToolConfig {
+                        command: "/bin/sh".to_owned(),
+                        args: vec![
+                            "-c".to_owned(),
+                            "exit 7".to_owned(),
+                            "test-sh".to_owned(),
+                            "{input}".to_owned(),
+                            "{output}".to_owned(),
+                        ],
+                        timeout_secs: 5,
+                    },
+                )));
+            },
+            fail_download,
+        )
+        .await
+    }
+
+    async fn app_with_audio_failure_config(
+        configure: impl FnOnce(&mut AppCoreConfig),
+        fail_download: bool,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+        Arc<FakeCodexSession>,
+    ) {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, messages) = if fail_download {
+            FakeTelegram::new_with_download_failure()
+        } else {
+            FakeTelegram::new()
+        };
+        let router = Arc::new(Router::new(4, telegram));
+        let codex = Arc::new(FakeCodexSession::default());
+        router.register_session(ChatId(1), 1, codex.clone()).await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let mut config = app_core_config(Vec::new(), true);
+        configure(&mut config);
+        let app = AppCore::new(
+            config,
+            memory,
+            RollingBuffer::new(10),
+            router,
+            runtime.clone(),
+        );
+        (app, runtime, messages, codex)
     }
 
     async fn app_with_fakes_and_allowed_chats(
@@ -1410,12 +1619,25 @@ mod tests {
 
     struct FakeTelegram {
         tx: mpsc::UnboundedSender<String>,
+        fail_download: AtomicBool,
     }
 
     impl FakeTelegram {
         fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<String>) {
             let (tx, rx) = mpsc::unbounded_channel();
-            (Arc::new(Self { tx }), rx)
+            (
+                Arc::new(Self {
+                    tx,
+                    fail_download: AtomicBool::new(false),
+                }),
+                rx,
+            )
+        }
+
+        fn new_with_download_failure() -> (Arc<Self>, mpsc::UnboundedReceiver<String>) {
+            let (telegram, rx) = Self::new();
+            telegram.fail_download.store(true, Ordering::SeqCst);
+            (telegram, rx)
         }
     }
 
@@ -1432,6 +1654,9 @@ mod tests {
             _file_id: &str,
             destination: &std::path::Path,
         ) -> Result<u64, TelegramError> {
+            if self.fail_download.load(Ordering::SeqCst) {
+                return Err(TelegramError::Download("test download failure".to_owned()));
+            }
             tokio::fs::write(destination, b"fake attachment bytes")
                 .await
                 .map_err(|err| TelegramError::Download(err.to_string()))?;
