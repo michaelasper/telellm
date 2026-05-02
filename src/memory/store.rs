@@ -65,6 +65,17 @@ pub trait MemoryStore: Send + Sync {
     async fn forget_all(&self, chat_id: ChatId) -> Result<u64, MemoryStoreError>;
 }
 
+#[async_trait]
+pub trait ChatSettingsStore: Send + Sync {
+    async fn voice_replies_enabled(&self, chat_id: ChatId) -> Result<bool, MemoryStoreError>;
+
+    async fn set_voice_replies_enabled(
+        &self,
+        chat_id: ChatId,
+        enabled: bool,
+    ) -> Result<(), MemoryStoreError>;
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryStoreError {
     #[error("sqlite error: {0}")]

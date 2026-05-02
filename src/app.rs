@@ -1,11 +1,13 @@
 use crate::{
     bot::{
-        command::{BotCommand, ForgetTarget},
+        command::{BotCommand, ForgetTarget, VoiceTarget},
         message::{Addressing, IncomingAttachment, IncomingMessage},
         telegram::{IncomingMessageHandler, TelegramError},
     },
-    config::{AppConfig, AttachmentConfig, CodexAuthMode, OutputConfig},
-    memory::{MemoryKind, MemoryStore, RollingBuffer, context::ContextPacket},
+    config::{AppConfig, AttachmentConfig, AudioConfig, CodexAuthMode, OutputConfig},
+    memory::{
+        MemoryKind, MemoryStore, RollingBuffer, context::ContextPacket, store::ChatSettingsStore,
+    },
     router::{GroupWorkItem, Router, RouterError},
     runtime::{ChatRuntimeStatus, RuntimeControl, RuntimeState},
 };
@@ -89,6 +91,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         queue_ack_enabled: config.telegram_ux.queue_ack_enabled,
         attachments: config.attachments.clone(),
         outputs: config.outputs.clone(),
+        audio: config.audio.clone(),
     };
     let app_core = Arc::new(AppCore::new(
         app_core_config,
@@ -104,7 +107,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 
 pub struct AppCore<M, S, T, N>
 where
-    M: MemoryStore + 'static,
+    M: MemoryStore + ChatSettingsStore + 'static,
     S: crate::codex::session::CodexSession + 'static,
     T: crate::bot::telegram::TelegramSink + 'static,
     N: RuntimeControl + 'static,
@@ -115,6 +118,7 @@ where
     queue_ack_enabled: bool,
     attachments: AttachmentConfig,
     outputs: OutputConfig,
+    audio: AudioConfig,
     memory_store: Arc<M>,
     rolling: Arc<Mutex<RollingBuffer>>,
     router: Arc<Router<S, T>>,
@@ -129,11 +133,12 @@ pub struct AppCoreConfig {
     pub queue_ack_enabled: bool,
     pub attachments: AttachmentConfig,
     pub outputs: OutputConfig,
+    pub audio: AudioConfig,
 }
 
 impl<M, S, T, N> AppCore<M, S, T, N>
 where
-    M: MemoryStore + 'static,
+    M: MemoryStore + ChatSettingsStore + 'static,
     S: crate::codex::session::CodexSession + 'static,
     T: crate::bot::telegram::TelegramSink + 'static,
     N: RuntimeControl + 'static,
@@ -152,6 +157,7 @@ where
             queue_ack_enabled,
             attachments,
             outputs,
+            audio,
         } = config;
 
         Self {
@@ -161,6 +167,7 @@ where
             queue_ack_enabled,
             attachments,
             outputs,
+            audio,
             memory_store,
             rolling: Arc::new(Mutex::new(rolling)),
             router,
@@ -272,6 +279,67 @@ where
                     .await?;
                 }
             },
+            BotCommand::Voice { target } => match target {
+                VoiceTarget::On => {
+                    if !self.audio.replies_enabled {
+                        self.reply_text(
+                            message.chat_id,
+                            "Spoken replies are disabled by the daemon operator.",
+                        )
+                        .await?;
+                    } else {
+                        self.memory_store
+                            .set_voice_replies_enabled(message.chat_id, true)
+                            .await?;
+                        self.reply_text(message.chat_id, "Spoken replies are on for this chat.")
+                            .await?;
+                    }
+                }
+                VoiceTarget::Off => {
+                    self.memory_store
+                        .set_voice_replies_enabled(message.chat_id, false)
+                        .await?;
+                    self.reply_text(message.chat_id, "Spoken replies are off for this chat.")
+                        .await?;
+                }
+                VoiceTarget::Status => {
+                    let chat_enabled = self
+                        .memory_store
+                        .voice_replies_enabled(message.chat_id)
+                        .await?;
+                    self.reply_text(
+                        message.chat_id,
+                        format!(
+                            "Audio: {}. Spoken replies: {}. Chat voice mode: {}.",
+                            if self.audio.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            if self.audio.replies_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            if chat_enabled { "on" } else { "off" }
+                        ),
+                    )
+                    .await?;
+                }
+            },
+            BotCommand::Summarize { focus } => {
+                let reply = match focus {
+                    Some(focus) => {
+                        format!(
+                            "Summarize was requested for `{focus}`, but recap generation is not wired yet."
+                        )
+                    }
+                    None => {
+                        "Summarize was requested, but recap generation is not wired yet.".to_owned()
+                    }
+                };
+                self.reply_text(message.chat_id, reply).await?;
+            }
         }
         Ok(())
     }
@@ -490,7 +558,7 @@ fn temp_attachment_path(message_id: crate::ids::MessageId, index: usize) -> Path
 #[async_trait]
 impl<M, S, T, N> IncomingMessageHandler for AppCore<M, S, T, N>
 where
-    M: MemoryStore + 'static,
+    M: MemoryStore + ChatSettingsStore + 'static,
     S: crate::codex::session::CodexSession + 'static,
     T: crate::bot::telegram::TelegramSink + 'static,
     N: RuntimeControl + 'static,
@@ -527,7 +595,7 @@ pub enum AppError {
 }
 
 fn help_text() -> &'static str {
-    "Show concise help for /status /reset /restart /rebuild /memory /remember /forget."
+    "Show concise help for /status /reset /restart /rebuild /memory /remember /forget /voice /summarize."
 }
 
 fn user_visible_error(error: &AppError) -> Option<&'static str> {
@@ -570,12 +638,13 @@ mod tests {
         bot::telegram::{TelegramError, TelegramSink},
         codex::session::{CodexRequest, CodexSession, CodexSessionError, CodexTurn},
         ids::{ChatId, MessageId, UserId},
+        memory::store::ChatSettingsStore,
         memory::{MemoryKind, MemoryRecord, MemoryStoreError},
     };
     use async_trait::async_trait;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::{
         sync::mpsc,
@@ -608,6 +677,7 @@ mod tests {
             queue_ack_enabled,
             attachments: AttachmentConfig::default(),
             outputs: OutputConfig::default(),
+            audio: AudioConfig::default(),
         }
     }
 
@@ -710,6 +780,24 @@ mod tests {
         assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
         assert_eq!(app.memory_store.remembered.load(Ordering::SeqCst), 1);
         assert!(messages.recv().await.expect("reply").contains("Remembered"));
+    }
+
+    #[tokio::test]
+    async fn voice_off_should_persist_chat_setting_without_runtime() {
+        let (app, runtime, mut messages) = app_with_fakes().await;
+
+        app.handle_message(incoming("/voice off"))
+            .await
+            .expect("voice command should work");
+
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+        assert!(messages.recv().await.expect("reply").contains("off"));
+        assert!(
+            !app.memory_store
+                .voice_replies_enabled(ChatId(1))
+                .await
+                .expect("setting should load")
+        );
     }
 
     #[tokio::test]
@@ -947,10 +1035,20 @@ mod tests {
         (app, runtime, messages)
     }
 
-    #[derive(Default)]
     struct FakeMemoryStore {
         forgotten: AtomicUsize,
         remembered: AtomicUsize,
+        voice_replies_enabled: AtomicBool,
+    }
+
+    impl Default for FakeMemoryStore {
+        fn default() -> Self {
+            Self {
+                forgotten: AtomicUsize::new(0),
+                remembered: AtomicUsize::new(0),
+                voice_replies_enabled: AtomicBool::new(true),
+            }
+        }
     }
 
     #[async_trait]
@@ -988,6 +1086,22 @@ mod tests {
         async fn forget_all(&self, _chat_id: ChatId) -> Result<u64, MemoryStoreError> {
             self.forgotten.fetch_add(1, Ordering::SeqCst);
             Ok(1)
+        }
+    }
+
+    #[async_trait]
+    impl ChatSettingsStore for FakeMemoryStore {
+        async fn voice_replies_enabled(&self, _chat_id: ChatId) -> Result<bool, MemoryStoreError> {
+            Ok(self.voice_replies_enabled.load(Ordering::SeqCst))
+        }
+
+        async fn set_voice_replies_enabled(
+            &self,
+            _chat_id: ChatId,
+            enabled: bool,
+        ) -> Result<(), MemoryStoreError> {
+            self.voice_replies_enabled.store(enabled, Ordering::SeqCst);
+            Ok(())
         }
     }
 

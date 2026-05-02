@@ -29,6 +29,8 @@ On startup, `telellm` registers this command list with Telegram so clients can s
 | `/memory` | none | Replies with durable memory records for the group. |
 | `/remember` | text | Stores the text as a durable `personality` memory for the group. |
 | `/forget` | `all` or text | `all` deletes all durable memory records for the group. Text targets are acknowledged but not currently deleted. |
+| `/voice` | `on`, `off`, or `status` | Manages spoken replies for the group. With no argument, reports audio daemon status, spoken-reply daemon status, and this chat's voice mode. |
+| `/summarize` | optional focus text | Requests a recap of recent chat, optionally focused on a topic. Recap generation is parsed now and wired in a later ingestion task. |
 
 ## Runtime Status Values
 
