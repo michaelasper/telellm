@@ -81,6 +81,14 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             crate::audio::LocalTts::new_with_max_output_bytes(tts, config.audio.max_file_bytes)
         })
         .map(Arc::new);
+    let url_ingestor = if config.url_ingestion.enabled {
+        Some(
+            Arc::new(crate::url::UrlIngestor::new(config.url_ingestion.clone())?)
+                as Arc<dyn crate::url::UrlContextProvider>,
+        )
+    } else {
+        None
+    };
     let router = Arc::new(if config.audio.replies_enabled {
         if let Some(audio_replies) = audio_tts.clone() {
             crate::router::Router::new_with_audio_replies(
@@ -129,6 +137,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             .map(crate::audio::LocalStt::new)
             .map(Arc::new),
         audio_tts,
+        url_ingestor,
     };
     let app_core = Arc::new(AppCore::new(
         app_core_config,
@@ -158,13 +167,14 @@ where
     audio: AudioConfig,
     audio_stt: Option<Arc<crate::audio::LocalStt>>,
     audio_tts: Option<Arc<crate::audio::LocalTts>>,
+    url_ingestor: Option<Arc<dyn crate::url::UrlContextProvider>>,
     memory_store: Arc<M>,
     rolling: Arc<Mutex<RollingBuffer>>,
     router: Arc<Router<S, T>>,
     runtime: Arc<N>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppCoreConfig {
     pub bot_username: String,
     pub system_prompt: String,
@@ -175,6 +185,7 @@ pub struct AppCoreConfig {
     pub audio: AudioConfig,
     pub audio_stt: Option<Arc<crate::audio::LocalStt>>,
     pub audio_tts: Option<Arc<crate::audio::LocalTts>>,
+    pub url_ingestor: Option<Arc<dyn crate::url::UrlContextProvider>>,
 }
 
 impl<M, S, T, N> AppCore<M, S, T, N>
@@ -201,6 +212,7 @@ where
             audio,
             audio_stt,
             audio_tts,
+            url_ingestor,
         } = config;
 
         Self {
@@ -213,6 +225,7 @@ where
             audio,
             audio_stt,
             audio_tts,
+            url_ingestor,
             memory_store,
             rolling: Arc::new(Mutex::new(rolling)),
             router,
@@ -251,6 +264,7 @@ where
         self.runtime.ensure_chat_runtime(message.chat_id).await?;
         self.prepare_audio(&mut message).await?;
         self.prepare_attachments(&mut message).await;
+        self.prepare_urls(&mut message).await;
         self.rolling.lock().await.push(message.clone());
         let audio_reply = if self.audio.enabled
             && self.audio.replies_enabled
@@ -758,6 +772,77 @@ where
         result
     }
 
+    async fn prepare_urls(&self, message: &mut IncomingMessage) {
+        let Some(url_ingestor) = &self.url_ingestor else {
+            return;
+        };
+
+        let urls = crate::url::detect_urls(&message.text);
+        if urls.is_empty() {
+            return;
+        }
+
+        for (index, result) in url_ingestor
+            .snapshots_for_text(message.message_id, &message.text)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            match result {
+                Ok(snapshot) => {
+                    let note_url = snapshot.original_url.clone();
+                    let import_result = self
+                        .runtime
+                        .import_chat_attachment(
+                            message.chat_id,
+                            &snapshot.host_path,
+                            &snapshot.workspace_path,
+                        )
+                        .await;
+                    match import_result {
+                        Ok(()) => {
+                            message.context_notes.push(format!(
+                                "URL context: {} ({}) saved at @{}",
+                                snapshot.title.as_deref().unwrap_or("untitled page"),
+                                snapshot.final_url,
+                                snapshot.workspace_path
+                            ));
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                chat_id = ?message.chat_id,
+                                message_id = ?message.message_id,
+                                url = %note_url,
+                                error = %err,
+                                "failed to import URL snapshot"
+                            );
+                            message
+                                .context_notes
+                                .push(format!("URL skipped: {note_url} ({err})"));
+                        }
+                    }
+                    remove_temp_file(&snapshot.host_path, "temporary URL snapshot").await;
+                }
+                Err(reason) => {
+                    let url = urls
+                        .get(index)
+                        .map(|url| url.as_str())
+                        .unwrap_or("unknown URL");
+                    tracing::warn!(
+                        chat_id = ?message.chat_id,
+                        message_id = ?message.message_id,
+                        url,
+                        error = %reason,
+                        "failed to ingest URL"
+                    );
+                    message
+                        .context_notes
+                        .push(format!("URL skipped: {url} ({reason})"));
+                }
+            }
+        }
+    }
+
     async fn enqueue_text(
         &self,
         chat_id: crate::ids::ChatId,
@@ -1019,6 +1104,7 @@ mod tests {
             audio: AudioConfig::default(),
             audio_stt: None,
             audio_tts: None,
+            url_ingestor: None,
         }
     }
 
@@ -1320,6 +1406,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn addressed_message_should_ingest_url_context() {
+        let (app, runtime, mut messages) = app_with_fakes_and_url_snapshot(
+            "https://example.com/",
+            "web_pages/msg-1/1-example.com.md",
+            "# Example\n\nReadable page text",
+        )
+        .await;
+
+        app.handle_message(incoming("@telellm_bot read https://example.com/"))
+            .await
+            .expect("message should be handled");
+
+        let prompt = messages.recv().await.expect("prompt");
+        let imported = runtime.imported.lock().await;
+        assert_eq!(
+            imported[0].workspace_path,
+            "web_pages/msg-1/1-example.com.md"
+        );
+        assert!(prompt.contains("URL context"));
+        assert!(prompt.contains("@web_pages/msg-1/1-example.com.md"));
+    }
+
+    #[tokio::test]
     async fn addressed_message_should_import_replied_attachment() {
         let (app, runtime, mut messages) = app_with_fakes().await;
         let mut message = incoming("@telellm_bot what is this?");
@@ -1602,6 +1711,49 @@ mod tests {
         (app, runtime, messages)
     }
 
+    async fn app_with_fakes_and_url_snapshot(
+        url: &str,
+        workspace_path: &str,
+        contents: &str,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, messages) = FakeTelegram::new();
+        let router = Arc::new(Router::new(4, telegram));
+        router
+            .register_session(ChatId(1), 1, Arc::new(FakeCodexSession::default()))
+            .await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let host_path = temp_attachment_path(MessageId(1), 99);
+        tokio::fs::write(&host_path, contents)
+            .await
+            .expect("fake URL snapshot should write");
+        let mut config = app_core_config(Vec::new(), true);
+        config.url_ingestor = Some(Arc::new(FakeUrlContextProvider {
+            snapshot: crate::url::UrlSnapshot {
+                original_url: url.to_owned(),
+                final_url: url.to_owned(),
+                title: Some("Example".to_owned()),
+                status: 200,
+                content_type: Some("text/html".to_owned()),
+                bytes: contents.len(),
+                workspace_path: workspace_path.to_owned(),
+                host_path,
+            },
+        }));
+        let app = AppCore::new(
+            config,
+            memory,
+            RollingBuffer::new(10),
+            router,
+            runtime.clone(),
+        );
+        (app, runtime, messages)
+    }
+
     async fn app_with_fakes_and_audio_stt_failure(
         fail_download: bool,
     ) -> (
@@ -1792,6 +1944,21 @@ mod tests {
         ) -> Result<(), MemoryStoreError> {
             self.voice_replies_enabled.store(enabled, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    struct FakeUrlContextProvider {
+        snapshot: crate::url::UrlSnapshot,
+    }
+
+    #[async_trait]
+    impl crate::url::UrlContextProvider for FakeUrlContextProvider {
+        async fn snapshots_for_text(
+            &self,
+            _message_id: MessageId,
+            _text: &str,
+        ) -> Vec<Result<crate::url::UrlSnapshot, crate::url::UrlIngestionError>> {
+            vec![Ok(self.snapshot.clone())]
         }
     }
 
