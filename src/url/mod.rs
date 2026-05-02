@@ -6,7 +6,7 @@ use reqwest::{
 };
 use scraper::{Html, Selector};
 use std::{
-    net::{IpAddr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -37,6 +37,8 @@ pub struct UrlSnapshot {
 pub enum UrlIngestionError {
     #[error("unsupported URL scheme")]
     UnsupportedScheme,
+    #[error("unsupported URL content type: {0}")]
+    UnsupportedContentType(String),
     #[error("URL host is blocked by safety policy")]
     BlockedHost,
     #[error("URL fetch failed: {0}")]
@@ -50,19 +52,13 @@ pub enum UrlIngestionError {
 #[derive(Clone)]
 pub struct UrlIngestor {
     config: UrlIngestionConfig,
-    client: reqwest::Client,
 }
 
 impl UrlIngestor {
     pub fn new(config: UrlIngestionConfig) -> Result<Self, UrlIngestionError> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .user_agent(config.user_agent.clone())
-            .build()
-            .map_err(|err| UrlIngestionError::Fetch(err.to_string()))?;
+        build_client(&config, None)?;
 
-        Ok(Self { config, client })
+        Ok(Self { config })
     }
 
     pub async fn fetch_snapshot(
@@ -71,14 +67,28 @@ impl UrlIngestor {
         index: usize,
         url: &Url,
     ) -> Result<UrlSnapshot, UrlIngestionError> {
+        self.fetch_snapshot_with_resolver(message_id, index, url, &SystemUrlAddressResolver)
+            .await
+    }
+
+    async fn fetch_snapshot_with_resolver<R>(
+        &self,
+        message_id: MessageId,
+        index: usize,
+        url: &Url,
+        resolver: &R,
+    ) -> Result<UrlSnapshot, UrlIngestionError>
+    where
+        R: UrlAddressResolver + ?Sized,
+    {
         let original_url = url.clone();
         let mut current_url = url.clone();
         let mut redirects = 0;
 
         let mut response = loop {
-            validate_fetch_url(&current_url).await?;
-            let response = self
-                .client
+            let hop = resolve_fetch_hop(&current_url, resolver).await?;
+            let client = build_client(&self.config, Some((&hop.host, &hop.addresses)))?;
+            let response = client
                 .get(current_url.clone())
                 .send()
                 .await
@@ -143,6 +153,40 @@ impl UrlIngestor {
     }
 }
 
+struct FetchHop {
+    host: String,
+    addresses: Vec<SocketAddr>,
+}
+
+#[async_trait]
+trait UrlAddressResolver: Send + Sync {
+    async fn resolve_validated_addresses(
+        &self,
+        url: &Url,
+    ) -> Result<Vec<SocketAddr>, UrlIngestionError>;
+}
+
+struct SystemUrlAddressResolver;
+
+#[async_trait]
+impl UrlAddressResolver for SystemUrlAddressResolver {
+    async fn resolve_validated_addresses(
+        &self,
+        url: &Url,
+    ) -> Result<Vec<SocketAddr>, UrlIngestionError> {
+        let host = url.host_str().ok_or(UrlIngestionError::UnsupportedScheme)?;
+        let port = url
+            .port_or_known_default()
+            .ok_or(UrlIngestionError::UnsupportedScheme)?;
+        let addresses: Vec<_> = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|err| UrlIngestionError::Fetch(err.to_string()))?
+            .collect();
+        validate_resolved_addresses(&addresses)?;
+        Ok(addresses)
+    }
+}
+
 #[async_trait]
 pub trait UrlContextProvider: Send + Sync {
     async fn snapshots_for_text(
@@ -192,21 +236,8 @@ pub fn detect_urls(text: &str) -> Vec<Url> {
 
 pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => {
-            ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_multicast()
-                || ip.is_unspecified()
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || ip.is_multicast()
-                || ip.is_unspecified()
-                || ipv6_mapped_private_ip(ip)
-        }
+        IpAddr::V4(ip) => !is_public_ipv4(ip),
+        IpAddr::V6(ip) => !is_public_ipv6(ip),
     }
 }
 
@@ -265,33 +296,60 @@ pub fn snapshot_workspace_path(
     )
 }
 
-async fn validate_fetch_url(url: &Url) -> Result<(), UrlIngestionError> {
+async fn resolve_fetch_hop<R>(url: &Url, resolver: &R) -> Result<FetchHop, UrlIngestionError>
+where
+    R: UrlAddressResolver + ?Sized,
+{
     if !matches!(url.scheme(), "http" | "https") {
         return Err(UrlIngestionError::UnsupportedScheme);
     }
 
-    let host = url.host_str().ok_or(UrlIngestionError::UnsupportedScheme)?;
-    let port = url
-        .port_or_known_default()
-        .ok_or(UrlIngestionError::UnsupportedScheme)?;
-    let mut addresses = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|err| UrlIngestionError::Fetch(err.to_string()))?;
-    let mut resolved_any = false;
-    for address in addresses.by_ref() {
-        resolved_any = true;
-        if is_blocked_ip(address.ip()) {
-            return Err(UrlIngestionError::BlockedHost);
-        }
-    }
-
-    if !resolved_any {
+    let host = url
+        .host_str()
+        .ok_or(UrlIngestionError::UnsupportedScheme)?
+        .to_owned();
+    let addresses = resolver.resolve_validated_addresses(url).await?;
+    if addresses.is_empty() {
         return Err(UrlIngestionError::Fetch(
             "URL host did not resolve to an address".to_owned(),
         ));
     }
 
+    Ok(FetchHop { host, addresses })
+}
+
+fn validate_resolved_addresses(addresses: &[SocketAddr]) -> Result<(), UrlIngestionError> {
+    if addresses.is_empty() {
+        return Err(UrlIngestionError::Fetch(
+            "URL host did not resolve to an address".to_owned(),
+        ));
+    }
+
+    for address in addresses {
+        if is_blocked_ip(address.ip()) {
+            return Err(UrlIngestionError::BlockedHost);
+        }
+    }
+
     Ok(())
+}
+
+fn build_client(
+    config: &UrlIngestionConfig,
+    resolved: Option<(&str, &[SocketAddr])>,
+) -> Result<reqwest::Client, UrlIngestionError> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(config.timeout_secs))
+        .user_agent(config.user_agent.clone());
+
+    if let Some((host, addresses)) = resolved {
+        builder = builder.resolve_to_addrs(host, addresses);
+    }
+
+    builder
+        .build()
+        .map_err(|err| UrlIngestionError::Fetch(err.to_string()))
 }
 
 async fn read_limited_body(
@@ -329,7 +387,9 @@ fn extract_response_text(
         });
     }
 
-    Err(UrlIngestionError::UnsupportedScheme)
+    Err(UrlIngestionError::UnsupportedContentType(
+        content_type.unwrap_or("unknown").to_owned(),
+    ))
 }
 
 fn collect_selector_text(document: &Html, selector: &Selector) -> String {
@@ -356,14 +416,57 @@ fn normalize_whitespace(text: &str) -> String {
     normalized
 }
 
-fn ipv6_mapped_private_ip(ip: Ipv6Addr) -> bool {
-    ip.to_ipv4_mapped().is_some_and(|mapped| {
-        mapped.is_loopback()
-            || mapped.is_private()
-            || mapped.is_link_local()
-            || mapped.is_multicast()
-            || mapped.is_unspecified()
-    })
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    ![
+        (Ipv4Addr::new(0, 0, 0, 0), 8),
+        (Ipv4Addr::new(10, 0, 0, 0), 8),
+        (Ipv4Addr::new(100, 64, 0, 0), 10),
+        (Ipv4Addr::new(127, 0, 0, 0), 8),
+        (Ipv4Addr::new(169, 254, 0, 0), 16),
+        (Ipv4Addr::new(172, 16, 0, 0), 12),
+        (Ipv4Addr::new(192, 0, 0, 0), 24),
+        (Ipv4Addr::new(192, 0, 2, 0), 24),
+        (Ipv4Addr::new(192, 88, 99, 0), 24),
+        (Ipv4Addr::new(192, 168, 0, 0), 16),
+        (Ipv4Addr::new(198, 18, 0, 0), 15),
+        (Ipv4Addr::new(198, 51, 100, 0), 24),
+        (Ipv4Addr::new(203, 0, 113, 0), 24),
+        (Ipv4Addr::new(224, 0, 0, 0), 4),
+        (Ipv4Addr::new(240, 0, 0, 0), 4),
+    ]
+    .into_iter()
+    .any(|(network, prefix)| ipv4_in_range(ip, network, prefix))
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    if ip.to_ipv4_mapped().is_some() {
+        return false;
+    }
+
+    ![
+        (Ipv6Addr::UNSPECIFIED, 128),
+        (Ipv6Addr::LOCALHOST, 128),
+        (Ipv6Addr::new(0x0064, 0xff9b, 0x0001, 0, 0, 0, 0, 0), 48),
+        (Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64),
+        (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
+        (Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32),
+        (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
+        (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
+        (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+        (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+    ]
+    .into_iter()
+    .any(|(network, prefix)| ipv6_in_range(ip, network, prefix))
+}
+
+fn ipv4_in_range(ip: Ipv4Addr, network: Ipv4Addr, prefix: u32) -> bool {
+    let mask = u32::MAX << (32 - prefix);
+    u32::from(ip) & mask == u32::from(network) & mask
+}
+
+fn ipv6_in_range(ip: Ipv6Addr, network: Ipv6Addr, prefix: u32) -> bool {
+    let mask = u128::MAX << (128 - prefix);
+    u128::from(ip) & mask == u128::from(network) & mask
 }
 
 fn temp_snapshot_path(message_id: MessageId, index: usize, url: &Url) -> PathBuf {
@@ -418,6 +521,11 @@ fn render_snapshot_markdown(
 mod tests {
     use super::*;
     use crate::config::UrlIngestionConfig;
+    use std::{net::SocketAddr, sync::Arc};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     #[test]
     fn detect_urls_should_trim_common_trailing_punctuation() {
@@ -433,6 +541,25 @@ mod tests {
         assert!(is_blocked_ip("172.16.0.1".parse().expect("ip")));
         assert!(is_blocked_ip("192.168.1.1".parse().expect("ip")));
         assert!(is_blocked_ip("169.254.1.1".parse().expect("ip")));
+        assert!(!is_blocked_ip("93.184.216.34".parse().expect("ip")));
+    }
+
+    #[test]
+    fn safety_should_reject_reserved_and_documentation_ranges() {
+        for ip in [
+            "100.64.0.1",
+            "198.18.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "255.255.255.255",
+            "2001:db8::1",
+        ] {
+            assert!(
+                is_blocked_ip(ip.parse().expect("ip")),
+                "{ip} should be blocked"
+            );
+        }
         assert!(!is_blocked_ip("93.184.216.34".parse().expect("ip")));
     }
 
@@ -457,5 +584,173 @@ mod tests {
             snapshot_workspace_path(&config.workspace_dir, crate::ids::MessageId(5), 0, &url),
             "web_pages/msg-5/1-example.com.md"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_should_fail_when_body_exceeds_limit() {
+        let addr = spawn_test_server(|_| {
+            http_response("200 OK", &[("Content-Type", "text/plain")], "123456")
+        })
+        .await;
+        let config = UrlIngestionConfig {
+            max_fetch_bytes: 5,
+            ..UrlIngestionConfig::default()
+        };
+        let ingestor = UrlIngestor::new(config).expect("ingestor");
+        let url = test_url(addr, "/large");
+        let resolver = StaticResolver::new("example.com", vec![addr]);
+
+        let err = ingestor
+            .fetch_snapshot_with_resolver(MessageId(9), 0, &url, &resolver)
+            .await
+            .expect_err("body should exceed limit");
+
+        assert!(matches!(err, UrlIngestionError::TooLarge(5)));
+    }
+
+    #[tokio::test]
+    async fn fetch_should_report_unsupported_content_type() {
+        let addr = spawn_test_server(|_| {
+            http_response("200 OK", &[("Content-Type", "application/pdf")], "%PDF")
+        })
+        .await;
+        let ingestor = UrlIngestor::new(UrlIngestionConfig::default()).expect("ingestor");
+        let url = test_url(addr, "/file.pdf");
+        let resolver = StaticResolver::new("example.com", vec![addr]);
+
+        let err = ingestor
+            .fetch_snapshot_with_resolver(MessageId(9), 0, &url, &resolver)
+            .await
+            .expect_err("pdf should be rejected");
+
+        match err {
+            UrlIngestionError::UnsupportedContentType(content_type) => {
+                assert_eq!(content_type, "application/pdf");
+            }
+            other => panic!("expected unsupported content type, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_should_reject_redirect_to_blocked_host() {
+        let addr = spawn_test_server(|_| {
+            http_response("302 Found", &[("Location", "http://127.0.0.1/private")], "")
+        })
+        .await;
+        let ingestor = UrlIngestor::new(UrlIngestionConfig::default()).expect("ingestor");
+        let url = test_url(addr, "/redirect");
+        let resolver = StaticResolver::new("example.com", vec![addr]);
+
+        let err = ingestor
+            .fetch_snapshot_with_resolver(MessageId(9), 0, &url, &resolver)
+            .await
+            .expect_err("redirect to loopback should be rejected");
+
+        assert!(matches!(err, UrlIngestionError::BlockedHost));
+    }
+
+    #[tokio::test]
+    async fn fetch_should_stop_after_redirect_limit() {
+        let addr =
+            spawn_test_server(|_| http_response("302 Found", &[("Location", "/loop")], "")).await;
+        let ingestor = UrlIngestor::new(UrlIngestionConfig::default()).expect("ingestor");
+        let url = test_url(addr, "/loop");
+        let resolver = StaticResolver::new("example.com", vec![addr]);
+
+        let err = ingestor
+            .fetch_snapshot_with_resolver(MessageId(9), 0, &url, &resolver)
+            .await
+            .expect_err("redirect loop should be capped");
+
+        match err {
+            UrlIngestionError::Fetch(reason) => assert!(reason.contains("too many URL redirects")),
+            other => panic!("expected redirect fetch error, got {other:?}"),
+        }
+    }
+
+    struct StaticResolver {
+        host: String,
+        addresses: Vec<SocketAddr>,
+    }
+
+    impl StaticResolver {
+        fn new(host: &str, addresses: Vec<SocketAddr>) -> Self {
+            Self {
+                host: host.to_owned(),
+                addresses,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl UrlAddressResolver for StaticResolver {
+        async fn resolve_validated_addresses(
+            &self,
+            url: &Url,
+        ) -> Result<Vec<SocketAddr>, UrlIngestionError> {
+            if url.host_str() == Some(self.host.as_str()) {
+                return Ok(self.addresses.clone());
+            }
+
+            let host = url.host_str().ok_or(UrlIngestionError::UnsupportedScheme)?;
+            let port = url
+                .port_or_known_default()
+                .ok_or(UrlIngestionError::UnsupportedScheme)?;
+            let address = SocketAddr::new(
+                host.parse::<IpAddr>()
+                    .map_err(|err| UrlIngestionError::Fetch(err.to_string()))?,
+                port,
+            );
+            validate_resolved_addresses(&[address])?;
+            Ok(vec![address])
+        }
+    }
+
+    async fn spawn_test_server(
+        handler: impl Fn(String) -> String + Send + Sync + 'static,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server address");
+        let handler = Arc::new(handler);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _peer)) = listener.accept().await else {
+                    break;
+                };
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 4096];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                    let response = handler(request);
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn test_url(addr: SocketAddr, path: &str) -> Url {
+        Url::parse(&format!("http://example.com:{}{path}", addr.port())).expect("test URL")
+    }
+
+    fn http_response(status: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            response.push_str(name);
+            response.push_str(": ");
+            response.push_str(value);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        response.push_str(body);
+        response
     }
 }
