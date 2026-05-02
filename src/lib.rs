@@ -1,4 +1,5 @@
 pub mod app;
+pub mod audio;
 pub mod bot;
 pub mod broker;
 pub mod codex;
