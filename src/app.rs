@@ -73,11 +73,36 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         config.limits.telegram_chunk_chars,
     ));
     let allowed_chat_ids = config.telegram.allowed_chat_ids.clone();
-    let router = Arc::new(crate::router::Router::new_with_telegram_ux(
-        config.limits.per_group_queue_depth,
-        telegram_sink,
-        config.telegram_ux.clone(),
-    ));
+    let audio_tts = config
+        .audio
+        .tts
+        .clone()
+        .map(|tts| {
+            crate::audio::LocalTts::new_with_max_output_bytes(tts, config.audio.max_file_bytes)
+        })
+        .map(Arc::new);
+    let router = Arc::new(if config.audio.replies_enabled {
+        if let Some(audio_replies) = audio_tts.clone() {
+            crate::router::Router::new_with_audio_replies(
+                config.limits.per_group_queue_depth,
+                telegram_sink,
+                config.telegram_ux.clone(),
+                audio_replies,
+            )
+        } else {
+            crate::router::Router::new_with_telegram_ux(
+                config.limits.per_group_queue_depth,
+                telegram_sink,
+                config.telegram_ux.clone(),
+            )
+        }
+    } else {
+        crate::router::Router::new_with_telegram_ux(
+            config.limits.per_group_queue_depth,
+            telegram_sink,
+            config.telegram_ux.clone(),
+        )
+    });
     let memory_url = format!("sqlite://{}?mode=rwc", config.storage.sqlite_path.display());
     let memory_store = Arc::new(crate::memory::SqliteMemoryStore::connect(&memory_url).await?);
     let runtime = Arc::new(crate::runtime::RuntimeManager::new(
@@ -103,6 +128,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             .clone()
             .map(crate::audio::LocalStt::new)
             .map(Arc::new),
+        audio_tts,
     };
     let app_core = Arc::new(AppCore::new(
         app_core_config,
@@ -131,6 +157,7 @@ where
     outputs: OutputConfig,
     audio: AudioConfig,
     audio_stt: Option<Arc<crate::audio::LocalStt>>,
+    audio_tts: Option<Arc<crate::audio::LocalTts>>,
     memory_store: Arc<M>,
     rolling: Arc<Mutex<RollingBuffer>>,
     router: Arc<Router<S, T>>,
@@ -147,6 +174,7 @@ pub struct AppCoreConfig {
     pub outputs: OutputConfig,
     pub audio: AudioConfig,
     pub audio_stt: Option<Arc<crate::audio::LocalStt>>,
+    pub audio_tts: Option<Arc<crate::audio::LocalTts>>,
 }
 
 impl<M, S, T, N> AppCore<M, S, T, N>
@@ -172,6 +200,7 @@ where
             outputs,
             audio,
             audio_stt,
+            audio_tts,
         } = config;
 
         Self {
@@ -183,6 +212,7 @@ where
             outputs,
             audio,
             audio_stt,
+            audio_tts,
             memory_store,
             rolling: Arc::new(Mutex::new(rolling)),
             router,
@@ -211,6 +241,25 @@ where
         self.prepare_audio(&mut message).await?;
         self.prepare_attachments(&mut message).await;
         self.rolling.lock().await.push(message.clone());
+        let audio_reply = if self.audio.enabled
+            && self.audio.replies_enabled
+            && message
+                .attachments
+                .iter()
+                .any(crate::audio::is_audio_attachment)
+            && self
+                .memory_store
+                .voice_replies_enabled(message.chat_id)
+                .await?
+        {
+            Some(crate::audio::AudioReplyRequest {
+                chat_id: message.chat_id,
+                trigger_message_id: message.message_id,
+                text: String::new(),
+            })
+        } else {
+            None
+        };
 
         let recent_messages = self.rolling.lock().await.recent_for_chat(message.chat_id);
         let memories = self.memory_store.list_memories(message.chat_id).await?;
@@ -220,7 +269,8 @@ where
             recent_messages,
             memories,
         };
-        self.enqueue_text(message.chat_id, packet.render()).await
+        self.enqueue_text(message.chat_id, packet.render(), audio_reply)
+            .await
     }
 
     async fn handle_command(
@@ -326,7 +376,7 @@ where
                     self.reply_text(
                         message.chat_id,
                         format!(
-                            "Audio: {}. Spoken replies: {}. Chat voice mode: {}.",
+                            "Audio: {}. Spoken replies: {}. Chat voice mode: {}. STT: {}. TTS: {}.",
                             if self.audio.enabled {
                                 "enabled"
                             } else {
@@ -337,7 +387,17 @@ where
                             } else {
                                 "disabled"
                             },
-                            if chat_enabled { "on" } else { "off" }
+                            if chat_enabled { "on" } else { "off" },
+                            if self.audio_stt.is_some() {
+                                "available"
+                            } else {
+                                "unavailable"
+                            },
+                            if self.audio_tts.is_some() {
+                                "available"
+                            } else {
+                                "unavailable"
+                            },
                         ),
                     )
                     .await?;
@@ -681,12 +741,14 @@ where
         &self,
         chat_id: crate::ids::ChatId,
         prompt: impl Into<String>,
+        audio_reply: Option<crate::audio::AudioReplyRequest>,
     ) -> Result<(), AppError> {
         let receipt = self
             .router
             .enqueue(GroupWorkItem {
                 chat_id,
                 prompt: prompt.into(),
+                audio_reply,
             })
             .await?;
         if self.queue_ack_enabled && receipt.queue_position > 0 {
@@ -935,6 +997,7 @@ mod tests {
             outputs: OutputConfig::default(),
             audio: AudioConfig::default(),
             audio_stt: None,
+            audio_tts: None,
         }
     }
 

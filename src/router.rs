@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 pub struct GroupWorkItem {
     pub chat_id: ChatId,
     pub prompt: String,
+    pub audio_reply: Option<crate::audio::AudioReplyRequest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +39,7 @@ where
     senders: Arc<Mutex<HashMap<ChatId, WorkerSender>>>,
     telegram: Arc<T>,
     telegram_ux: TelegramUxConfig,
+    audio_replies: Option<Arc<dyn crate::audio::AudioReplySynthesizer>>,
 }
 
 struct RegisteredSession<S> {
@@ -64,6 +66,20 @@ struct WorkerSender {
 struct QueuedWorkItem {
     item: GroupWorkItem,
     queued_typing: Option<TypingHandle>,
+}
+
+struct ChatWorker<S, T>
+where
+    S: CodexSession + 'static,
+    T: TelegramSink + 'static,
+{
+    session: Arc<S>,
+    generation: u64,
+    sessions: Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
+    telegram: Arc<T>,
+    telegram_ux: TelegramUxConfig,
+    audio_replies: Option<Arc<dyn crate::audio::AudioReplySynthesizer>>,
+    state: Arc<WorkerState>,
 }
 
 struct TypingHandle {
@@ -118,6 +134,23 @@ where
             senders: Arc::new(Mutex::new(HashMap::new())),
             telegram,
             telegram_ux,
+            audio_replies: None,
+        }
+    }
+
+    pub fn new_with_audio_replies(
+        queue_depth: usize,
+        telegram: Arc<T>,
+        telegram_ux: TelegramUxConfig,
+        audio_replies: Arc<dyn crate::audio::AudioReplySynthesizer>,
+    ) -> Self {
+        Self {
+            queue_depth: queue_depth.max(1),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            senders: Arc::new(Mutex::new(HashMap::new())),
+            telegram,
+            telegram_ux,
+            audio_replies: Some(audio_replies),
         }
     }
 
@@ -189,15 +222,19 @@ where
 
         let telegram = self.telegram.clone();
         let telegram_ux = self.telegram_ux.clone();
+        let audio_replies = self.audio_replies.clone();
         let (tx, rx) = mpsc::channel(self.queue_depth);
         let state = Arc::new(WorkerState::default());
         Self::spawn_chat_worker(
-            registered.session,
-            registered.generation,
-            self.sessions.clone(),
-            telegram,
-            telegram_ux,
-            state.clone(),
+            ChatWorker {
+                session: registered.session,
+                generation: registered.generation,
+                sessions: self.sessions.clone(),
+                telegram,
+                telegram_ux,
+                audio_replies,
+                state: state.clone(),
+            },
             rx,
         );
 
@@ -210,22 +247,27 @@ where
         Ok(sender)
     }
 
-    fn spawn_chat_worker(
-        session: Arc<S>,
-        generation: u64,
-        sessions: Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
-        telegram: Arc<T>,
-        telegram_ux: TelegramUxConfig,
-        state: Arc<WorkerState>,
-        mut rx: mpsc::Receiver<QueuedWorkItem>,
-    ) {
+    fn spawn_chat_worker(worker: ChatWorker<S, T>, mut rx: mpsc::Receiver<QueuedWorkItem>) {
+        let ChatWorker {
+            session,
+            generation,
+            sessions,
+            telegram,
+            telegram_ux,
+            audio_replies,
+            state,
+        } = worker;
         tokio::spawn(async move {
             while let Some(queued_item) = rx.recv().await {
                 if let Some(typing) = queued_item.queued_typing {
                     typing.stop();
                 }
                 let item = queued_item.item;
-                let GroupWorkItem { chat_id, prompt } = item;
+                let GroupWorkItem {
+                    chat_id,
+                    prompt,
+                    audio_reply,
+                } = item;
                 if Self::worker_is_stale(&sessions, chat_id, generation).await {
                     break;
                 }
@@ -281,6 +323,7 @@ where
                                 .await
                                 .map(|_| ())
                         };
+                        let text_sent = send_result.is_ok();
                         if let Err(err) = send_result {
                             tracing::warn!(
                                 error = %err,
@@ -289,6 +332,16 @@ where
                             );
                         }
                         Self::send_generated_files(&telegram, chat_id, turn.generated_files).await;
+                        if text_sent {
+                            Self::send_audio_reply(
+                                &telegram,
+                                audio_replies.clone(),
+                                chat_id,
+                                audio_reply,
+                                &turn.output,
+                            )
+                            .await;
+                        }
                     }
                     Err(err) => {
                         let text = format!("Codex session failed: {err}");
@@ -439,6 +492,57 @@ where
             if let Err(err) = tokio::fs::remove_file(&file.host_path).await {
                 log_generated_file_cleanup_error(&file, err);
             }
+        }
+    }
+
+    async fn send_audio_reply(
+        telegram: &Arc<T>,
+        audio_replies: Option<Arc<dyn crate::audio::AudioReplySynthesizer>>,
+        chat_id: ChatId,
+        audio_reply: Option<crate::audio::AudioReplyRequest>,
+        output: &str,
+    ) {
+        let (Some(audio_replies), Some(request)) = (audio_replies, audio_reply) else {
+            return;
+        };
+
+        let mut request = request.clone();
+        request.text = output.to_owned();
+        let audio = match audio_replies.synthesize_reply(request).await {
+            Ok(Some(audio)) => audio,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    chat_id = ?chat_id,
+                    "failed to synthesize spoken Telegram reply"
+                );
+                return;
+            }
+        };
+
+        if let Err(err) = telegram
+            .send_audio_file(
+                chat_id,
+                &audio.host_path,
+                &audio.file_name,
+                audio.send_as.telegram_kind(),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %err,
+                chat_id = ?chat_id,
+                path = %audio.host_path.display(),
+                "failed to send spoken Telegram reply"
+            );
+        }
+        if let Err(err) = tokio::fs::remove_file(&audio.host_path).await {
+            tracing::debug!(
+                error = %err,
+                path = %audio.host_path.display(),
+                "failed to remove temporary spoken reply file"
+            );
         }
     }
 
@@ -603,12 +707,30 @@ pub enum RouterError {
 mod tests {
     use super::*;
     use crate::codex::session::{CodexEventSender, CodexTurn};
+    use crate::{
+        audio::{AudioError, AudioReplyRequest, AudioReplySynthesizer, SynthesizedAudio},
+        config::AudioSendAs,
+    };
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use tokio::{
         sync::{Mutex, mpsc},
         time::{Duration, timeout},
     };
+
+    type FakeTelegramWithAudio = (
+        Arc<FakeTelegram>,
+        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<ChatId>,
+        mpsc::UnboundedReceiver<String>,
+    );
+    type FakeTelegramWithDocumentsAndAudio = (
+        Arc<FakeTelegram>,
+        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<ChatId>,
+        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<String>,
+    );
 
     struct FakeSession {
         reply_prefix: &'static str,
@@ -784,7 +906,56 @@ mod tests {
         messages: mpsc::UnboundedSender<String>,
         typing_actions: mpsc::UnboundedSender<ChatId>,
         documents: mpsc::UnboundedSender<String>,
+        audio_files: mpsc::UnboundedSender<String>,
         next_message_id: AtomicI32,
+    }
+
+    struct FakeAudioReplySynthesizer {
+        bytes: Vec<u8>,
+    }
+
+    impl FakeAudioReplySynthesizer {
+        fn new(bytes: impl AsRef<[u8]>) -> Self {
+            Self {
+                bytes: bytes.as_ref().to_vec(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AudioReplySynthesizer for FakeAudioReplySynthesizer {
+        async fn synthesize_reply(
+            &self,
+            _request: AudioReplyRequest,
+        ) -> Result<Option<SynthesizedAudio>, AudioError> {
+            let file = tempfile::NamedTempFile::new().expect("temp audio file should be created");
+            let path = file.path().to_path_buf();
+            tokio::fs::write(&path, &self.bytes)
+                .await
+                .expect("temp audio file should be writable");
+            let path = file
+                .into_temp_path()
+                .keep()
+                .expect("temp audio file should persist for Telegram send");
+            Ok(Some(SynthesizedAudio {
+                host_path: path,
+                file_name: "reply.ogg".to_owned(),
+                send_as: AudioSendAs::Voice,
+                bytes: self.bytes.len() as u64,
+            }))
+        }
+    }
+
+    struct FailingAudioReplySynthesizer;
+
+    #[async_trait]
+    impl AudioReplySynthesizer for FailingAudioReplySynthesizer {
+        async fn synthesize_reply(
+            &self,
+            _request: AudioReplyRequest,
+        ) -> Result<Option<SynthesizedAudio>, AudioError> {
+            Err(AudioError::EmptyOutput)
+        }
     }
 
     #[async_trait]
@@ -850,10 +1021,59 @@ mod tests {
                 message_id: MessageId(self.next_message_id.fetch_add(1, Ordering::SeqCst)),
             })
         }
+
+        async fn send_audio_file(
+            &self,
+            _chat_id: ChatId,
+            path: &std::path::Path,
+            file_name: &str,
+            kind: crate::bot::telegram::TelegramAudioSendKind,
+        ) -> Result<TelegramMessageHandle, TelegramError> {
+            let kind = match kind {
+                crate::bot::telegram::TelegramAudioSendKind::Voice => "voice",
+                crate::bot::telegram::TelegramAudioSendKind::Audio => "audio",
+            };
+            let text = format!("{kind}:{file_name}:{}", path.exists());
+            self.audio_files
+                .send(text)
+                .map_err(|err| TelegramError::AudioSend(err.to_string()))?;
+            Ok(TelegramMessageHandle {
+                chat_id: ChatId(1),
+                message_id: MessageId(self.next_message_id.fetch_add(1, Ordering::SeqCst)),
+            })
+        }
+    }
+
+    impl FakeTelegram {
+        fn new() -> FakeTelegramWithAudio {
+            let (telegram, messages, typing_actions, _documents, audio_files) =
+                Self::new_with_documents();
+            (telegram, messages, typing_actions, audio_files)
+        }
+
+        fn new_with_documents() -> FakeTelegramWithDocumentsAndAudio {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (typing_tx, typing_rx) = mpsc::unbounded_channel();
+            let (document_tx, document_rx) = mpsc::unbounded_channel();
+            let (audio_tx, audio_rx) = mpsc::unbounded_channel();
+            (
+                Arc::new(FakeTelegram {
+                    messages: tx,
+                    typing_actions: typing_tx,
+                    documents: document_tx,
+                    audio_files: audio_tx,
+                    next_message_id: AtomicI32::new(1),
+                }),
+                rx,
+                typing_rx,
+                document_rx,
+                audio_rx,
+            )
+        }
     }
 
     fn fake_telegram() -> (Arc<FakeTelegram>, mpsc::UnboundedReceiver<String>) {
-        let (telegram, messages, _typing_actions, _documents) = fake_telegram_with_actions();
+        let (telegram, messages, _typing_actions, _audio_files) = FakeTelegram::new();
         (telegram, messages)
     }
 
@@ -863,20 +1083,9 @@ mod tests {
         mpsc::UnboundedReceiver<ChatId>,
         mpsc::UnboundedReceiver<String>,
     ) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (typing_tx, typing_rx) = mpsc::unbounded_channel();
-        let (document_tx, document_rx) = mpsc::unbounded_channel();
-        (
-            Arc::new(FakeTelegram {
-                messages: tx,
-                typing_actions: typing_tx,
-                documents: document_tx,
-                next_message_id: AtomicI32::new(1),
-            }),
-            rx,
-            typing_rx,
-            document_rx,
-        )
+        let (telegram, messages, typing_actions, documents, _audio_files) =
+            FakeTelegram::new_with_documents();
+        (telegram, messages, typing_actions, documents)
     }
 
     async fn receive_message(rx: &mut mpsc::UnboundedReceiver<String>) -> String {
@@ -897,6 +1106,13 @@ mod tests {
         timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("document should arrive before timeout")
+            .expect("telegram sender should stay open")
+    }
+
+    async fn receive_audio_file(rx: &mut mpsc::UnboundedReceiver<String>) -> String {
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("audio file should arrive before timeout")
             .expect("telegram sender should stay open")
     }
 
@@ -921,6 +1137,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "hello".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("enqueue should work");
@@ -944,6 +1161,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "make file".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("enqueue should work");
@@ -960,6 +1178,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_should_send_spoken_reply_after_text_for_audio_turn() {
+        let (telegram, mut messages, _typing, mut audio_files) = FakeTelegram::new();
+        let synthesizer = Arc::new(FakeAudioReplySynthesizer::new("reply audio"));
+        let router =
+            Router::new_with_audio_replies(4, telegram, TelegramUxConfig::default(), synthesizer);
+        router
+            .register_session(ChatId(1), 1, Arc::new(FakeSession::default()))
+            .await;
+
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "hello".to_owned(),
+                audio_reply: Some(AudioReplyRequest {
+                    chat_id: ChatId(1),
+                    trigger_message_id: MessageId(7),
+                    text: String::new(),
+                }),
+            })
+            .await
+            .expect("enqueue should work");
+
+        let text = receive_message(&mut messages).await;
+        let audio = receive_audio_file(&mut audio_files).await;
+
+        assert!(text.contains("reply: hello"));
+        assert!(audio.contains("voice"));
+    }
+
+    #[tokio::test]
+    async fn router_should_keep_text_when_audio_synthesis_fails() {
+        let (telegram, mut messages, _typing, mut audio_files) = FakeTelegram::new();
+        let synthesizer = Arc::new(FailingAudioReplySynthesizer);
+        let router =
+            Router::new_with_audio_replies(4, telegram, TelegramUxConfig::default(), synthesizer);
+        router
+            .register_session(ChatId(1), 1, Arc::new(FakeSession::default()))
+            .await;
+
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "hello".to_owned(),
+                audio_reply: Some(AudioReplyRequest {
+                    chat_id: ChatId(1),
+                    trigger_message_id: MessageId(7),
+                    text: String::new(),
+                }),
+            })
+            .await
+            .expect("enqueue should work");
+
+        assert!(
+            receive_message(&mut messages)
+                .await
+                .contains("reply: hello")
+        );
+        assert!(matches!(
+            audio_files.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn enqueue_should_serialize_concurrent_work_for_a_chat() {
         let (telegram, mut messages) = fake_telegram();
         let session = Arc::new(FakeSession::default());
@@ -972,6 +1254,7 @@ mod tests {
                 .enqueue(GroupWorkItem {
                     chat_id: ChatId(1),
                     prompt: "one".to_owned(),
+                    audio_reply: None,
                 })
                 .await
         });
@@ -981,6 +1264,7 @@ mod tests {
                 .enqueue(GroupWorkItem {
                     chat_id: ChatId(1),
                     prompt: "two".to_owned(),
+                    audio_reply: None,
                 })
                 .await
         });
@@ -1011,6 +1295,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "one".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("first enqueue should work");
@@ -1020,6 +1305,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "two".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("second enqueue should work");
@@ -1047,6 +1333,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "one".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("enqueue should work");
@@ -1077,6 +1364,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "stream please".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("enqueue should work");
@@ -1113,6 +1401,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "exec-style".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("enqueue should work");
@@ -1144,6 +1433,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "complete-now".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("enqueue should work");
@@ -1170,6 +1460,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "before".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("first enqueue should work");
@@ -1181,6 +1472,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "after".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("second enqueue should work");
@@ -1202,6 +1494,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "stale".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("first enqueue should work");
@@ -1214,6 +1507,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "fresh".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("second enqueue should work");
@@ -1244,6 +1538,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(1),
                 prompt: "stale".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect("first enqueue should work");
@@ -1269,6 +1564,7 @@ mod tests {
             .enqueue(GroupWorkItem {
                 chat_id: ChatId(404),
                 prompt: "hello".to_owned(),
+                audio_reply: None,
             })
             .await
             .expect_err("enqueue should fail without a registered session");

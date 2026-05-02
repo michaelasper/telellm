@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,6 +19,7 @@ use tokio::{
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 20_000_000;
 const STDERR_TAIL_BYTES: usize = 4096;
 const STDERR_DRAIN_AFTER_REAP: Duration = Duration::from_millis(100);
+static TEMP_AUDIO_REPLY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcript {
@@ -215,6 +217,23 @@ pub trait AudioReplySynthesizer: Send + Sync {
     ) -> Result<Option<SynthesizedAudio>, AudioError>;
 }
 
+#[async_trait]
+impl AudioReplySynthesizer for LocalTts {
+    async fn synthesize_reply(
+        &self,
+        request: AudioReplyRequest,
+    ) -> Result<Option<SynthesizedAudio>, AudioError> {
+        let output = temp_audio_reply_path(request.trigger_message_id, self.config.send_as);
+        match self.synthesize_to(&request.text, &output).await {
+            Ok(audio) => Ok(Some(audio)),
+            Err(err) => {
+                remove_temp_audio_reply(&output).await;
+                Err(err)
+            }
+        }
+    }
+}
+
 fn expand_args(args: &[String], input: Option<&Path>, output: &Path) -> Vec<String> {
     args.iter()
         .map(|arg| {
@@ -327,6 +346,35 @@ fn validate_output_limit(bytes: u64, limit: u64) -> Result<(), AudioError> {
     }
 
     Ok(())
+}
+
+fn temp_audio_reply_path(message_id: MessageId, send_as: AudioSendAs) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = TEMP_AUDIO_REPLY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let extension = match send_as {
+        AudioSendAs::Voice => "ogg",
+        AudioSendAs::Audio => "mp3",
+    };
+    std::env::temp_dir().join(format!(
+        "telellm-tts-{}-{}-{nanos}-{counter}.{extension}",
+        std::process::id(),
+        message_id.0
+    ))
+}
+
+async fn remove_temp_audio_reply(path: &Path) {
+    if let Err(err) = tokio::fs::remove_file(path).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(
+            error = %err,
+            path = %path.display(),
+            "failed to remove temporary spoken reply after synthesis failure"
+        );
+    }
 }
 
 async fn read_stderr_tail(stderr: Option<tokio::process::ChildStderr>) -> String {
