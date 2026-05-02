@@ -68,6 +68,18 @@ pub enum AudioError {
         command: String,
         source: std::io::Error,
     },
+    #[error("audio command `{command}` stdin was unavailable after spawn")]
+    StdinUnavailable { command: String },
+    #[error("audio command `{command}` stdin write failed after spawn: {source}")]
+    StdinWrite {
+        command: String,
+        source: std::io::Error,
+    },
+    #[error("audio command `{command}` wait failed after spawn: {source}")]
+    Wait {
+        command: String,
+        source: std::io::Error,
+    },
     #[error("audio command `{command}` timed out after {timeout_secs} seconds")]
     Timeout { command: String, timeout_secs: u64 },
     #[error("audio command `{command}` exited with status {status}: {stderr}")]
@@ -274,23 +286,22 @@ async fn run_audio_command(
 
     let command_result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         if let Some(text) = stdin_text {
-            let mut stdin = child.stdin.take().ok_or_else(|| AudioError::Spawn {
-                command: command.to_owned(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "audio command stdin was unavailable",
-                ),
-            })?;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| AudioError::StdinUnavailable {
+                    command: command.to_owned(),
+                })?;
             stdin
                 .write_all(text.as_bytes())
                 .await
-                .map_err(|source| AudioError::Spawn {
+                .map_err(|source| AudioError::StdinWrite {
                     command: command.to_owned(),
                     source,
                 })?;
         }
 
-        child.wait().await.map_err(|source| AudioError::Spawn {
+        child.wait().await.map_err(|source| AudioError::Wait {
             command: command.to_owned(),
             source,
         })
@@ -558,6 +569,34 @@ mod tests {
             panic!("expected exit error");
         };
         assert!(stderr.contains("early-exit"), "{stderr}");
+    }
+
+    #[tokio::test]
+    async fn tts_stdin_write_failure_should_not_report_spawn_failure() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("reply.ogg");
+        let runner = LocalTts::new(AudioTtsConfig {
+            command: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "exit 0".to_owned(),
+                "test-sh".to_owned(),
+                "{output}".to_owned(),
+            ],
+            stdin_text: true,
+            timeout_secs: 5,
+            send_as: AudioSendAs::Voice,
+        });
+        let text = "x".repeat(4 * 1024 * 1024);
+
+        let err = runner
+            .synthesize_to(&text, &output)
+            .await
+            .expect_err("closed stdin should fail synthesis");
+
+        let message = err.to_string();
+        assert!(message.contains("stdin write failed"), "{message}");
+        assert!(!message.contains("failed to spawn"), "{message}");
     }
 
     #[tokio::test]

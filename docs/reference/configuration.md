@@ -71,7 +71,7 @@ All fields are optional. The section controls inbound audio transcription and op
 | `workspace_dir` | string | `telegram_audio` | Relative directory under `/workspace` where imported audio artifacts are stored. |
 | `max_file_bytes` | integer | `20000000` | Maximum Telegram audio file size to download for transcription and maximum generated TTS output size. |
 
-`workspace_dir` must be a non-empty relative path without parent directory components. `max_file_bytes` must be greater than zero. STT and TTS command subsections are optional.
+`workspace_dir` must be a non-empty relative path without parent directory components. `max_file_bytes` must be greater than zero and at most `20000000`, matching Telegram Bot API download limits. STT and TTS command subsections are optional.
 
 Audio defaults to enabled, but STT and TTS are unavailable unless their command subsections are configured. `/voice status` reports the effective runtime state: global audio, global spoken replies, the chat's voice mode, STT availability, and TTS availability.
 

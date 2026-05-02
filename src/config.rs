@@ -9,6 +9,8 @@ use std::{
 
 use crate::ids::ChatId;
 
+const TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES: u64 = 20_000_000;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub telegram: TelegramConfig,
@@ -531,6 +533,12 @@ fn validate_audio_config(audio: &AudioConfig) -> Result<(), ConfigError> {
             reason: "must be greater than zero",
         });
     }
+    if audio.max_file_bytes > TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES {
+        return Err(ConfigError::InvalidValue {
+            field: "audio.max_file_bytes",
+            reason: "must be at most 20000000 bytes because Telegram Bot API downloads are capped at 20 MB",
+        });
+    }
     if let Some(stt) = &audio.stt {
         validate_audio_tool_config("audio.stt", stt)?;
     }
@@ -753,7 +761,7 @@ fn default_attachment_workspace_dir() -> String {
 }
 
 fn default_attachment_max_file_bytes() -> u64 {
-    20_000_000
+    TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES
 }
 
 fn default_output_workspace_dir() -> String {
@@ -773,7 +781,7 @@ fn default_audio_workspace_dir() -> String {
 }
 
 fn default_audio_max_file_bytes() -> u64 {
-    20_000_000
+    TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES
 }
 
 fn default_audio_tool_timeout_secs() -> u64 {
@@ -913,6 +921,12 @@ workspace_dir = "../audio"
             (
                 r#"[audio]
 max_file_bytes = 0
+"#,
+                "audio.max_file_bytes",
+            ),
+            (
+                r#"[audio]
+max_file_bytes = 20000001
 "#,
                 "audio.max_file_bytes",
             ),

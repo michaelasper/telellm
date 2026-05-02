@@ -223,7 +223,9 @@ impl UrlContextProvider for UrlIngestor {
 pub fn detect_urls(text: &str) -> Vec<Url> {
     text.split_whitespace()
         .filter_map(|token| {
-            let trimmed = token.trim_end_matches(['.', ',', ')', ';', ']', '}', '>']);
+            let trimmed = token
+                .trim_start_matches(['(', '[', '{', '<', '"', '\''])
+                .trim_end_matches(['.', ',', ')', ';', ']', '}', '>', '"', '\'']);
             let url = Url::parse(trimmed).ok()?;
             if matches!(url.scheme(), "http" | "https") {
                 Some(url)
@@ -534,6 +536,13 @@ mod tests {
     fn detect_urls_should_trim_common_trailing_punctuation() {
         let urls = detect_urls("Read https://example.com/path?x=1, then https://example.org.");
         assert_eq!(urls[0].as_str(), "https://example.com/path?x=1");
+        assert_eq!(urls[1].as_str(), "https://example.org/");
+    }
+
+    #[test]
+    fn detect_urls_should_trim_common_leading_wrappers() {
+        let urls = detect_urls("Read (https://example.com/path) and <https://example.org>.");
+        assert_eq!(urls[0].as_str(), "https://example.com/path");
         assert_eq!(urls[1].as_str(), "https://example.org/");
     }
 
