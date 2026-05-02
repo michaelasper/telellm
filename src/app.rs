@@ -404,17 +404,22 @@ where
                 }
             },
             BotCommand::Summarize { focus } => {
-                let reply = match focus {
-                    Some(focus) => {
-                        format!(
-                            "Summarize was requested for `{focus}`, but recap generation is not wired yet."
+                self.runtime.ensure_chat_runtime(message.chat_id).await?;
+                let recent_messages = self.rolling.lock().await.recent_for_chat(message.chat_id);
+                match crate::summary::build_summary_prompt(
+                    &self.system_prompt_for_turn(),
+                    &recent_messages,
+                    focus.as_deref(),
+                ) {
+                    Ok(prompt) => self.enqueue_text(message.chat_id, prompt, None).await?,
+                    Err(crate::summary::SummaryPromptError::NoRecentChat) => {
+                        self.reply_text(
+                            message.chat_id,
+                            "There is not enough recent chat to summarize.",
                         )
+                        .await?;
                     }
-                    None => {
-                        "Summarize was requested, but recap generation is not wired yet.".to_owned()
-                    }
-                };
-                self.reply_text(message.chat_id, reply).await?;
+                }
             }
         }
         Ok(())
@@ -1100,6 +1105,27 @@ mod tests {
         assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
         assert_eq!(app.memory_store.remembered.load(Ordering::SeqCst), 1);
         assert!(messages.recv().await.expect("reply").contains("Remembered"));
+    }
+
+    #[tokio::test]
+    async fn summarize_should_enqueue_recent_chat_without_memory_write() {
+        let (app, runtime, mut messages) = app_with_fakes().await;
+
+        app.handle_message(incoming("the deploy is blocked"))
+            .await
+            .expect("ambient should store");
+        app.handle_message(incoming("/summarize deploy"))
+            .await
+            .expect("summarize should work");
+
+        let prompt = messages
+            .recv()
+            .await
+            .expect("summary prompt should be echoed");
+        assert!(prompt.contains("catch-up recap"));
+        assert!(prompt.contains("the deploy is blocked"));
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.memory_store.remembered.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
