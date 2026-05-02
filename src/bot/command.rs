@@ -8,12 +8,21 @@ pub enum BotCommand {
     Memory,
     Remember { content: String },
     Forget { target: ForgetTarget },
+    Voice { target: VoiceTarget },
+    Summarize { focus: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForgetTarget {
     All,
     Query(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceTarget {
+    On,
+    Off,
+    Status,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +63,14 @@ pub const COMMAND_DEFINITIONS: &[CommandDefinition] = &[
     CommandDefinition {
         command: "forget",
         description: "Forget durable group memories.",
+    },
+    CommandDefinition {
+        command: "voice",
+        description: "Manage spoken replies for this chat.",
+    },
+    CommandDefinition {
+        command: "summarize",
+        description: "Summarize recent chat for catching up.",
     },
 ];
 
@@ -122,6 +139,18 @@ impl BotCommand {
                     }))
                 }
             }
+            "voice" => {
+                let target = match rest.to_ascii_lowercase().as_str() {
+                    "" | "status" => VoiceTarget::Status,
+                    "on" => VoiceTarget::On,
+                    "off" => VoiceTarget::Off,
+                    _ => return Err(CommandParseError::Unknown(format!("voice {rest}"))),
+                };
+                Ok(Some(Self::Voice { target }))
+            }
+            "summarize" => Ok(Some(Self::Summarize {
+                focus: (!rest.is_empty()).then(|| rest.to_owned()),
+            })),
             other => Err(CommandParseError::Unknown(other.to_owned())),
         }
     }
@@ -185,6 +214,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_should_capture_voice_commands() {
+        assert_eq!(
+            BotCommand::parse("/voice on", "telellm_bot").expect("parse"),
+            Some(BotCommand::Voice {
+                target: VoiceTarget::On,
+            })
+        );
+        assert_eq!(
+            BotCommand::parse("/voice off", "telellm_bot").expect("parse"),
+            Some(BotCommand::Voice {
+                target: VoiceTarget::Off,
+            })
+        );
+        assert_eq!(
+            BotCommand::parse("/voice status", "telellm_bot").expect("parse"),
+            Some(BotCommand::Voice {
+                target: VoiceTarget::Status,
+            })
+        );
+        assert_eq!(
+            BotCommand::parse("/voice", "telellm_bot").expect("parse"),
+            Some(BotCommand::Voice {
+                target: VoiceTarget::Status,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_should_capture_summarize_commands() {
+        assert_eq!(
+            BotCommand::parse("/summarize", "telellm_bot").expect("parse"),
+            Some(BotCommand::Summarize { focus: None })
+        );
+        assert_eq!(
+            BotCommand::parse("/summarize the deploy", "telellm_bot").expect("parse"),
+            Some(BotCommand::Summarize {
+                focus: Some("the deploy".to_owned()),
+            })
+        );
+    }
+
+    #[test]
     fn command_definitions_should_include_supported_commands() {
         let commands: Vec<_> = command_definitions()
             .iter()
@@ -194,7 +265,16 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                "help", "status", "reset", "restart", "rebuild", "memory", "remember", "forget"
+                "help",
+                "status",
+                "reset",
+                "restart",
+                "rebuild",
+                "memory",
+                "remember",
+                "forget",
+                "voice",
+                "summarize"
             ]
         );
     }

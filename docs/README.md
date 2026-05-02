@@ -17,6 +17,7 @@ Use the how-to guides when you already know what you want to accomplish:
 - [How to configure Telegram access](how-to/configure-telegram-access.md)
 - [How to configure Codex authentication](how-to/configure-codex-auth.md)
 - [How to send Telegram attachments to Codex](how-to/send-attachments.md)
+- [How to use voice and audio](how-to/use-voice-and-audio.md)
 - [How to send generated files back to Telegram](how-to/send-generated-files.md)
 - [How to manage a group runtime](how-to/manage-group-runtime.md)
 - [How to manage group memory](how-to/manage-group-memory.md)

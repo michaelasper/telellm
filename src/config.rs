@@ -9,6 +9,8 @@ use std::{
 
 use crate::ids::ChatId;
 
+const TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES: u64 = 20_000_000;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub telegram: TelegramConfig,
@@ -18,6 +20,10 @@ pub struct AppConfig {
     pub attachments: AttachmentConfig,
     #[serde(default)]
     pub outputs: OutputConfig,
+    #[serde(default)]
+    pub audio: AudioConfig,
+    #[serde(default)]
+    pub url_ingestion: UrlIngestionConfig,
     #[serde(default)]
     pub prompt: PromptConfig,
     pub storage: StorageConfig,
@@ -86,6 +92,67 @@ pub struct OutputConfig {
     pub max_files_per_response: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub replies_enabled: bool,
+    #[serde(default = "default_audio_workspace_dir")]
+    pub workspace_dir: String,
+    #[serde(default = "default_audio_max_file_bytes")]
+    pub max_file_bytes: u64,
+    #[serde(default)]
+    pub stt: Option<AudioToolConfig>,
+    #[serde(default)]
+    pub tts: Option<AudioTtsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioToolConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_audio_tool_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioTtsConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_true")]
+    pub stdin_text: bool,
+    #[serde(default = "default_audio_tool_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_audio_send_as")]
+    pub send_as: AudioSendAs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioSendAs {
+    Voice,
+    Audio,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UrlIngestionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_url_workspace_dir")]
+    pub workspace_dir: String,
+    #[serde(default = "default_max_urls_per_message")]
+    pub max_urls_per_message: usize,
+    #[serde(default = "default_max_fetch_bytes")]
+    pub max_fetch_bytes: usize,
+    #[serde(default = "default_url_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+}
+
 impl Default for AttachmentConfig {
     fn default() -> Self {
         Self {
@@ -103,6 +170,32 @@ impl Default for OutputConfig {
             workspace_dir: default_output_workspace_dir(),
             max_file_bytes: default_output_max_file_bytes(),
             max_files_per_response: default_output_max_files_per_response(),
+        }
+    }
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            replies_enabled: default_true(),
+            workspace_dir: default_audio_workspace_dir(),
+            max_file_bytes: default_audio_max_file_bytes(),
+            stt: None,
+            tts: None,
+        }
+    }
+}
+
+impl Default for UrlIngestionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            workspace_dir: default_url_workspace_dir(),
+            max_urls_per_message: default_max_urls_per_message(),
+            max_fetch_bytes: default_max_fetch_bytes(),
+            timeout_secs: default_url_timeout_secs(),
+            user_agent: default_user_agent(),
         }
     }
 }
@@ -254,6 +347,8 @@ impl AppConfig {
         validate_telegram_ux_config(&self.telegram_ux)?;
         validate_attachment_config(&self.attachments)?;
         validate_output_config(&self.outputs)?;
+        validate_audio_config(&self.audio)?;
+        validate_url_ingestion_config(&self.url_ingestion)?;
         require_non_empty("prompt.system_prompt", &self.prompt.system_prompt)?;
         require_non_empty("docker.image", &self.docker.image)?;
         require_non_empty("docker.network", &self.docker.network)?;
@@ -429,6 +524,70 @@ fn validate_output_config(outputs: &OutputConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_audio_config(audio: &AudioConfig) -> Result<(), ConfigError> {
+    require_non_empty("audio.workspace_dir", &audio.workspace_dir)?;
+    validate_relative_workspace_path("audio.workspace_dir", &audio.workspace_dir)?;
+    if audio.max_file_bytes == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "audio.max_file_bytes",
+            reason: "must be greater than zero",
+        });
+    }
+    if audio.max_file_bytes > TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES {
+        return Err(ConfigError::InvalidValue {
+            field: "audio.max_file_bytes",
+            reason: "must be at most 20000000 bytes because Telegram Bot API downloads are capped at 20 MB",
+        });
+    }
+    if let Some(stt) = &audio.stt {
+        validate_audio_tool_config("audio.stt", stt)?;
+    }
+    if let Some(tts) = &audio.tts {
+        require_non_empty("audio.tts.command", &tts.command)?;
+        require_positive_u64("audio.tts.timeout_secs", tts.timeout_secs)?;
+    }
+    Ok(())
+}
+
+fn validate_audio_tool_config(
+    prefix: &'static str,
+    tool: &AudioToolConfig,
+) -> Result<(), ConfigError> {
+    require_non_empty(
+        match prefix {
+            "audio.stt" => "audio.stt.command",
+            _ => "audio.tool.command",
+        },
+        &tool.command,
+    )?;
+    require_positive_u64(
+        match prefix {
+            "audio.stt" => "audio.stt.timeout_secs",
+            _ => "audio.tool.timeout_secs",
+        },
+        tool.timeout_secs,
+    )
+}
+
+fn validate_url_ingestion_config(urls: &UrlIngestionConfig) -> Result<(), ConfigError> {
+    require_non_empty("url_ingestion.workspace_dir", &urls.workspace_dir)?;
+    validate_relative_workspace_path("url_ingestion.workspace_dir", &urls.workspace_dir)?;
+    require_non_empty("url_ingestion.user_agent", &urls.user_agent)?;
+    if urls.max_urls_per_message == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "url_ingestion.max_urls_per_message",
+            reason: "must be greater than zero",
+        });
+    }
+    if urls.max_fetch_bytes == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "url_ingestion.max_fetch_bytes",
+            reason: "must be greater than zero",
+        });
+    }
+    require_positive_u64("url_ingestion.timeout_secs", urls.timeout_secs)
+}
+
 fn validate_relative_workspace_path(field: &'static str, value: &str) -> Result<(), ConfigError> {
     let path = Path::new(value);
     if path.is_absolute() {
@@ -602,7 +761,7 @@ fn default_attachment_workspace_dir() -> String {
 }
 
 fn default_attachment_max_file_bytes() -> u64 {
-    20_000_000
+    TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES
 }
 
 fn default_output_workspace_dir() -> String {
@@ -617,12 +776,47 @@ fn default_output_max_files_per_response() -> usize {
     4
 }
 
+fn default_audio_workspace_dir() -> String {
+    "telegram_audio".to_owned()
+}
+
+fn default_audio_max_file_bytes() -> u64 {
+    TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES
+}
+
+fn default_audio_tool_timeout_secs() -> u64 {
+    120
+}
+
+fn default_audio_send_as() -> AudioSendAs {
+    AudioSendAs::Voice
+}
+
+fn default_url_workspace_dir() -> String {
+    "web_pages".to_owned()
+}
+
+fn default_max_urls_per_message() -> usize {
+    3
+}
+
+fn default_max_fetch_bytes() -> usize {
+    2_000_000
+}
+
+fn default_url_timeout_secs() -> u64 {
+    20
+}
+
+fn default_user_agent() -> String {
+    "telellm/0.1".to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn valid_config() -> &'static str {
-        r#"
+    const MINIMAL_CONFIG: &str = r#"
             [telegram]
             bot_token_env = "TELEGRAM_BOT_TOKEN"
             bot_username = "telellm_bot"
@@ -645,7 +839,146 @@ mod tests {
             public_base_url = "http://host.docker.internal:8189/v1"
             upstream_base_url = "https://api.openai.com/v1"
             upstream_api_key_env = "OPENAI_API_KEY"
-        "#
+        "#;
+
+    fn valid_config() -> &'static str {
+        MINIMAL_CONFIG
+    }
+
+    #[test]
+    fn audio_config_should_default_to_enabled_local_commands_absent() {
+        let config = AppConfig::from_toml_str(MINIMAL_CONFIG).expect("config should parse");
+
+        assert!(config.audio.enabled);
+        assert!(config.audio.replies_enabled);
+        assert_eq!(config.audio.workspace_dir, "telegram_audio");
+        assert_eq!(config.audio.max_file_bytes, 20_000_000);
+        assert!(config.audio.stt.is_none());
+        assert!(config.audio.tts.is_none());
+    }
+
+    #[test]
+    fn audio_config_should_parse_local_commands() {
+        let raw = format!(
+            "{}\n{}",
+            MINIMAL_CONFIG,
+            r#"
+[audio]
+enabled = true
+replies_enabled = true
+workspace_dir = "audio"
+max_file_bytes = 1234
+
+[audio.stt]
+command = "whisper-cli"
+args = ["--file", "{input}", "--output-txt", "{output}"]
+timeout_secs = 9
+
+[audio.tts]
+command = "piper"
+args = ["--output_file", "{output}"]
+stdin_text = true
+timeout_secs = 8
+send_as = "audio"
+"#
+        );
+
+        let config = AppConfig::from_toml_str(&raw).expect("config should parse");
+
+        assert_eq!(config.audio.workspace_dir, "audio");
+        assert_eq!(config.audio.max_file_bytes, 1234);
+        assert_eq!(
+            config.audio.stt.as_ref().expect("stt").command,
+            "whisper-cli"
+        );
+        assert_eq!(
+            config.audio.tts.as_ref().expect("tts").send_as,
+            AudioSendAs::Audio
+        );
+    }
+
+    #[test]
+    fn url_ingestion_config_should_default_to_enabled() {
+        let config = AppConfig::from_toml_str(MINIMAL_CONFIG).expect("config should parse");
+
+        assert!(config.url_ingestion.enabled);
+        assert_eq!(config.url_ingestion.workspace_dir, "web_pages");
+        assert_eq!(config.url_ingestion.max_urls_per_message, 3);
+        assert_eq!(config.url_ingestion.max_fetch_bytes, 2_000_000);
+        assert_eq!(config.url_ingestion.timeout_secs, 20);
+        assert_eq!(config.url_ingestion.user_agent, "telellm/0.1");
+    }
+
+    #[test]
+    fn config_should_reject_invalid_audio_and_url_limits() {
+        let cases = [
+            (
+                r#"[audio]
+workspace_dir = "../audio"
+"#,
+                "audio.workspace_dir",
+            ),
+            (
+                r#"[audio]
+max_file_bytes = 0
+"#,
+                "audio.max_file_bytes",
+            ),
+            (
+                r#"[audio]
+max_file_bytes = 20000001
+"#,
+                "audio.max_file_bytes",
+            ),
+            (
+                r#"[audio.stt]
+command = "whisper-cli"
+timeout_secs = 0
+"#,
+                "audio.stt.timeout_secs",
+            ),
+            (
+                r#"[audio.tts]
+command = "piper"
+timeout_secs = 0
+"#,
+                "audio.tts.timeout_secs",
+            ),
+            (
+                r#"[url_ingestion]
+workspace_dir = "/web"
+"#,
+                "url_ingestion.workspace_dir",
+            ),
+            (
+                r#"[url_ingestion]
+max_urls_per_message = 0
+"#,
+                "url_ingestion.max_urls_per_message",
+            ),
+            (
+                r#"[url_ingestion]
+max_fetch_bytes = 0
+"#,
+                "url_ingestion.max_fetch_bytes",
+            ),
+            (
+                r#"[url_ingestion]
+timeout_secs = 0
+"#,
+                "url_ingestion.timeout_secs",
+            ),
+        ];
+
+        for (snippet, field) in cases {
+            let raw = format!("{MINIMAL_CONFIG}\n{snippet}\n");
+            let err =
+                AppConfig::from_toml_str(&raw).expect_err("config should reject invalid value");
+            assert!(
+                err.to_string().contains(field),
+                "expected `{field}` in `{err}`"
+            );
+        }
     }
 
     #[test]

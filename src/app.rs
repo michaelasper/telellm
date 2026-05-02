@@ -1,11 +1,13 @@
 use crate::{
     bot::{
-        command::{BotCommand, ForgetTarget},
+        command::{BotCommand, ForgetTarget, VoiceTarget},
         message::{Addressing, IncomingAttachment, IncomingMessage},
         telegram::{IncomingMessageHandler, TelegramError},
     },
-    config::{AppConfig, AttachmentConfig, CodexAuthMode, OutputConfig},
-    memory::{MemoryKind, MemoryStore, RollingBuffer, context::ContextPacket},
+    config::{AppConfig, AttachmentConfig, AudioConfig, CodexAuthMode, OutputConfig},
+    memory::{
+        MemoryKind, MemoryStore, RollingBuffer, context::ContextPacket, store::ChatSettingsStore,
+    },
     router::{GroupWorkItem, Router, RouterError},
     runtime::{ChatRuntimeStatus, RuntimeControl, RuntimeState},
 };
@@ -13,11 +15,16 @@ use anyhow::Context;
 use async_trait::async_trait;
 use secrecy::ExposeSecret;
 use std::{
-    path::PathBuf,
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     if let Some(parent) = config
@@ -66,13 +73,48 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         config.limits.telegram_chunk_chars,
     ));
     let allowed_chat_ids = config.telegram.allowed_chat_ids.clone();
-    let router = Arc::new(crate::router::Router::new_with_telegram_ux(
-        config.limits.per_group_queue_depth,
-        telegram_sink,
-        config.telegram_ux.clone(),
-    ));
     let memory_url = format!("sqlite://{}?mode=rwc", config.storage.sqlite_path.display());
     let memory_store = Arc::new(crate::memory::SqliteMemoryStore::connect(&memory_url).await?);
+    let audio_tts = config
+        .audio
+        .tts
+        .clone()
+        .map(|tts| {
+            crate::audio::LocalTts::new_with_max_output_bytes(tts, config.audio.max_file_bytes)
+        })
+        .map(Arc::new);
+    let url_ingestor = if config.url_ingestion.enabled {
+        Some(
+            Arc::new(crate::url::UrlIngestor::new(config.url_ingestion.clone())?)
+                as Arc<dyn crate::url::UrlContextProvider>,
+        )
+    } else {
+        None
+    };
+    let audio_replies = if config.audio.replies_enabled {
+        audio_tts.clone().map(|audio_replies| {
+            Arc::new(VoiceModeAudioReplySynthesizer::new(
+                memory_store.clone(),
+                audio_replies,
+            )) as Arc<dyn crate::audio::AudioReplySynthesizer>
+        })
+    } else {
+        None
+    };
+    let router = Arc::new(if let Some(audio_replies) = audio_replies {
+        crate::router::Router::new_with_audio_replies(
+            config.limits.per_group_queue_depth,
+            telegram_sink,
+            config.telegram_ux.clone(),
+            audio_replies,
+        )
+    } else {
+        crate::router::Router::new_with_telegram_ux(
+            config.limits.per_group_queue_depth,
+            telegram_sink,
+            config.telegram_ux.clone(),
+        )
+    });
     let runtime = Arc::new(crate::runtime::RuntimeManager::new(
         crate::sandbox::docker::DockerSandboxBackend,
         config.docker.clone(),
@@ -89,6 +131,15 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         queue_ack_enabled: config.telegram_ux.queue_ack_enabled,
         attachments: config.attachments.clone(),
         outputs: config.outputs.clone(),
+        audio: config.audio.clone(),
+        audio_stt: config
+            .audio
+            .stt
+            .clone()
+            .map(crate::audio::LocalStt::new)
+            .map(Arc::new),
+        audio_tts,
+        url_ingestor,
     };
     let app_core = Arc::new(AppCore::new(
         app_core_config,
@@ -104,7 +155,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 
 pub struct AppCore<M, S, T, N>
 where
-    M: MemoryStore + 'static,
+    M: MemoryStore + ChatSettingsStore + 'static,
     S: crate::codex::session::CodexSession + 'static,
     T: crate::bot::telegram::TelegramSink + 'static,
     N: RuntimeControl + 'static,
@@ -115,13 +166,17 @@ where
     queue_ack_enabled: bool,
     attachments: AttachmentConfig,
     outputs: OutputConfig,
+    audio: AudioConfig,
+    audio_stt: Option<Arc<crate::audio::LocalStt>>,
+    audio_tts: Option<Arc<crate::audio::LocalTts>>,
+    url_ingestor: Option<Arc<dyn crate::url::UrlContextProvider>>,
     memory_store: Arc<M>,
     rolling: Arc<Mutex<RollingBuffer>>,
     router: Arc<Router<S, T>>,
     runtime: Arc<N>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppCoreConfig {
     pub bot_username: String,
     pub system_prompt: String,
@@ -129,11 +184,15 @@ pub struct AppCoreConfig {
     pub queue_ack_enabled: bool,
     pub attachments: AttachmentConfig,
     pub outputs: OutputConfig,
+    pub audio: AudioConfig,
+    pub audio_stt: Option<Arc<crate::audio::LocalStt>>,
+    pub audio_tts: Option<Arc<crate::audio::LocalTts>>,
+    pub url_ingestor: Option<Arc<dyn crate::url::UrlContextProvider>>,
 }
 
 impl<M, S, T, N> AppCore<M, S, T, N>
 where
-    M: MemoryStore + 'static,
+    M: MemoryStore + ChatSettingsStore + 'static,
     S: crate::codex::session::CodexSession + 'static,
     T: crate::bot::telegram::TelegramSink + 'static,
     N: RuntimeControl + 'static,
@@ -152,6 +211,10 @@ where
             queue_ack_enabled,
             attachments,
             outputs,
+            audio,
+            audio_stt,
+            audio_tts,
+            url_ingestor,
         } = config;
 
         Self {
@@ -161,6 +224,10 @@ where
             queue_ack_enabled,
             attachments,
             outputs,
+            audio,
+            audio_stt,
+            audio_tts,
+            url_ingestor,
             memory_store,
             rolling: Arc::new(Mutex::new(rolling)),
             router,
@@ -181,13 +248,48 @@ where
         }
 
         if let Some(command) = command {
-            self.rolling.lock().await.push(message.clone());
-            return self.handle_command(message, command).await;
+            let pre_command_recent_messages = {
+                let mut rolling = self.rolling.lock().await;
+                let snapshot = if matches!(&command, BotCommand::Summarize { .. }) {
+                    Some(rolling.recent_for_chat(message.chat_id))
+                } else {
+                    None
+                };
+                rolling.push(message.clone());
+                snapshot
+            };
+            return self
+                .handle_command(message, command, pre_command_recent_messages)
+                .await;
         }
 
+        if let Some(reason) = self.trigger_audio_only_preflight_failure(&message) {
+            return Err(AppError::Audio(reason));
+        }
         self.runtime.ensure_chat_runtime(message.chat_id).await?;
+        self.prepare_audio(&mut message).await?;
         self.prepare_attachments(&mut message).await;
+        self.prepare_urls(&mut message).await;
         self.rolling.lock().await.push(message.clone());
+        let audio_reply = if self.audio.enabled
+            && self.audio.replies_enabled
+            && message
+                .attachments
+                .iter()
+                .any(crate::audio::is_audio_attachment)
+            && self
+                .memory_store
+                .voice_replies_enabled(message.chat_id)
+                .await?
+        {
+            Some(crate::audio::AudioReplyRequest {
+                chat_id: message.chat_id,
+                trigger_message_id: message.message_id,
+                text: String::new(),
+            })
+        } else {
+            None
+        };
 
         let recent_messages = self.rolling.lock().await.recent_for_chat(message.chat_id);
         let memories = self.memory_store.list_memories(message.chat_id).await?;
@@ -197,13 +299,15 @@ where
             recent_messages,
             memories,
         };
-        self.enqueue_text(message.chat_id, packet.render()).await
+        self.enqueue_text(message.chat_id, packet.render(), audio_reply)
+            .await
     }
 
     async fn handle_command(
         &self,
         message: IncomingMessage,
         command: BotCommand,
+        pre_command_recent_messages: Option<Vec<IncomingMessage>>,
     ) -> Result<(), AppError> {
         match command {
             BotCommand::Help => {
@@ -272,6 +376,88 @@ where
                     .await?;
                 }
             },
+            BotCommand::Voice { target } => match target {
+                VoiceTarget::On => {
+                    if !self.audio.replies_enabled {
+                        self.reply_text(
+                            message.chat_id,
+                            "Spoken replies are disabled by the daemon operator.",
+                        )
+                        .await?;
+                    } else {
+                        self.memory_store
+                            .set_voice_replies_enabled(message.chat_id, true)
+                            .await?;
+                        self.reply_text(message.chat_id, "Spoken replies are on for this chat.")
+                            .await?;
+                    }
+                }
+                VoiceTarget::Off => {
+                    self.memory_store
+                        .set_voice_replies_enabled(message.chat_id, false)
+                        .await?;
+                    self.reply_text(message.chat_id, "Spoken replies are off for this chat.")
+                        .await?;
+                }
+                VoiceTarget::Status => {
+                    let chat_enabled = self
+                        .memory_store
+                        .voice_replies_enabled(message.chat_id)
+                        .await?;
+                    self.reply_text(
+                        message.chat_id,
+                        format!(
+                            "Audio: {}. Spoken replies: {}. Chat voice mode: {}. STT: {}. TTS: {}.",
+                            if self.audio.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            if self.audio.replies_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            if chat_enabled { "on" } else { "off" },
+                            if self.audio_stt.is_some() {
+                                "available"
+                            } else {
+                                "unavailable"
+                            },
+                            if self.audio_tts.is_some() {
+                                "available"
+                            } else {
+                                "unavailable"
+                            },
+                        ),
+                    )
+                    .await?;
+                }
+            },
+            BotCommand::Summarize { focus } => {
+                let recent_messages = if let Some(recent_messages) = pre_command_recent_messages {
+                    recent_messages
+                } else {
+                    self.rolling.lock().await.recent_for_chat(message.chat_id)
+                };
+                match crate::summary::build_summary_prompt(
+                    &self.system_prompt_for_turn(),
+                    &recent_messages,
+                    focus.as_deref(),
+                ) {
+                    Ok(prompt) => {
+                        self.runtime.ensure_chat_runtime(message.chat_id).await?;
+                        self.enqueue_text(message.chat_id, prompt, None).await?;
+                    }
+                    Err(crate::summary::SummaryPromptError::NoRecentChat) => {
+                        self.reply_text(
+                            message.chat_id,
+                            "There is not enough recent chat to summarize.",
+                        )
+                        .await?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -288,6 +474,39 @@ where
         format!("{}\n\n{}", self.system_prompt.trim(), instruction)
     }
 
+    fn trigger_audio_only_preflight_failure(&self, message: &IncomingMessage) -> Option<String> {
+        if !message.text.trim().is_empty() {
+            return None;
+        }
+        let mut audio_attachments = message
+            .attachments
+            .iter()
+            .filter(|attachment| crate::audio::is_audio_attachment(attachment));
+        let first_audio = audio_attachments.next()?;
+
+        if !self.audio.enabled {
+            return Some("audio imports are disabled by configuration".to_owned());
+        }
+        if self.audio_stt.is_none() {
+            return Some("audio transcription is not configured".to_owned());
+        }
+        if first_audio.file_size > self.audio.max_file_bytes {
+            return Some(format!(
+                "file size {} exceeds configured audio limit {} bytes",
+                first_audio.file_size, self.audio.max_file_bytes
+            ));
+        }
+        for attachment in audio_attachments {
+            if attachment.file_size > self.audio.max_file_bytes {
+                return Some(format!(
+                    "file size {} exceeds configured audio limit {} bytes",
+                    attachment.file_size, self.audio.max_file_bytes
+                ));
+            }
+        }
+        None
+    }
+
     async fn reply_text(
         &self,
         chat_id: crate::ids::ChatId,
@@ -298,6 +517,182 @@ where
             .send_message(chat_id, text.as_ref())
             .await?;
         Ok(())
+    }
+
+    async fn prepare_audio(&self, message: &mut IncomingMessage) -> Result<(), AppError> {
+        let mut trigger_has_usable_context = !message.text.trim().is_empty();
+        let mut trigger_audio_failure = None;
+        self.prepare_audio_attachment_list(
+            message.chat_id,
+            message.message_id,
+            &mut message.attachments,
+            &mut message.context_notes,
+            &mut trigger_has_usable_context,
+            &mut trigger_audio_failure,
+        )
+        .await;
+
+        if let Some(reply_to) = &mut message.reply_to {
+            let mut reply_has_usable_context = false;
+            let mut reply_audio_failure = None;
+            self.prepare_audio_attachment_list(
+                message.chat_id,
+                reply_to.message_id,
+                &mut reply_to.attachments,
+                &mut reply_to.context_notes,
+                &mut reply_has_usable_context,
+                &mut reply_audio_failure,
+            )
+            .await;
+        }
+
+        if !trigger_has_usable_context && let Some(reason) = trigger_audio_failure {
+            return Err(AppError::Audio(reason));
+        }
+
+        Ok(())
+    }
+
+    async fn prepare_audio_attachment_list(
+        &self,
+        chat_id: crate::ids::ChatId,
+        message_id: crate::ids::MessageId,
+        attachments: &mut [IncomingAttachment],
+        context_notes: &mut Vec<String>,
+        has_usable_context: &mut bool,
+        first_audio_failure: &mut Option<String>,
+    ) {
+        if attachments.is_empty() {
+            return;
+        }
+
+        for (index, attachment) in attachments.iter_mut().enumerate() {
+            if !crate::audio::is_audio_attachment(attachment) {
+                continue;
+            }
+
+            if !self.audio.enabled {
+                handle_skipped_audio(
+                    attachment,
+                    context_notes,
+                    None,
+                    first_audio_failure,
+                    "audio imports are disabled by configuration".to_owned(),
+                );
+                continue;
+            }
+
+            match self
+                .import_audio_attachment(chat_id, message_id, index, attachment)
+                .await
+            {
+                Ok(imported) => {
+                    attachment.workspace_path = Some(imported.workspace_path.clone());
+                    if let Some(transcript) = imported.transcript {
+                        context_notes.push(format!(
+                            "Audio transcript from @{}: {}",
+                            imported.workspace_path, transcript
+                        ));
+                        *has_usable_context = true;
+                    } else if let Some(reason) = imported.skipped_reason {
+                        tracing::warn!(
+                            chat_id = ?chat_id,
+                            message_id = ?message_id,
+                            file_unique_id = %attachment.file_unique_id,
+                            reason = %reason,
+                            "failed to transcribe Telegram audio attachment"
+                        );
+                        handle_skipped_audio(
+                            attachment,
+                            context_notes,
+                            Some(&imported.workspace_path),
+                            first_audio_failure,
+                            reason,
+                        );
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        chat_id = ?chat_id,
+                        message_id = ?message_id,
+                        file_unique_id = %attachment.file_unique_id,
+                        reason = %reason,
+                        "failed to import Telegram audio attachment"
+                    );
+                    handle_skipped_audio(
+                        attachment,
+                        context_notes,
+                        None,
+                        first_audio_failure,
+                        reason,
+                    );
+                }
+            }
+        }
+    }
+
+    async fn import_audio_attachment(
+        &self,
+        chat_id: crate::ids::ChatId,
+        message_id: crate::ids::MessageId,
+        index: usize,
+        attachment: &IncomingAttachment,
+    ) -> Result<crate::audio::ImportedAudio, String> {
+        if attachment.file_size > self.audio.max_file_bytes {
+            return Err(format!(
+                "file size {} exceeds configured audio limit {} bytes",
+                attachment.file_size, self.audio.max_file_bytes
+            ));
+        }
+
+        let workspace_path = crate::audio::audio_workspace_path(
+            &self.audio.workspace_dir,
+            message_id,
+            index,
+            attachment,
+        );
+        let temp_path = temp_attachment_path(message_id, index);
+        let transcript_path = temp_audio_transcript_path(message_id, index);
+        let result = async {
+            let downloaded_bytes = self
+                .router
+                .telegram()
+                .download_file_to_path(&attachment.file_id, &temp_path)
+                .await
+                .map_err(|err| err.to_string())?;
+            if downloaded_bytes > self.audio.max_file_bytes {
+                return Err(format!(
+                    "downloaded file size {downloaded_bytes} exceeds configured audio limit {} bytes",
+                    self.audio.max_file_bytes
+                ));
+            }
+            self.runtime
+                .import_chat_attachment(chat_id, &temp_path, &workspace_path)
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let mut imported = crate::audio::ImportedAudio {
+                workspace_path,
+                transcript: None,
+                skipped_reason: None,
+            };
+            if let Some(stt) = &self.audio_stt {
+                match stt.transcribe_to(&temp_path, &transcript_path).await {
+                    Ok(transcript) => imported.transcript = Some(transcript.text),
+                    Err(err) => imported.skipped_reason = Some(err.to_string()),
+                }
+            } else {
+                imported.skipped_reason = Some("audio transcription is not configured".to_owned());
+            }
+
+            Ok(imported)
+        }
+        .await;
+
+        remove_temp_file(&temp_path, "temporary Telegram audio attachment").await;
+        remove_temp_file(&transcript_path, "temporary Telegram audio transcript").await;
+
+        result
     }
 
     async fn prepare_attachments(&self, message: &mut IncomingMessage) {
@@ -329,6 +724,9 @@ where
 
         if !self.attachments.enabled {
             for attachment in attachments {
+                if crate::audio::is_audio_attachment(attachment) {
+                    continue;
+                }
                 attachment.skipped_reason =
                     Some("attachment downloads are disabled by configuration".to_owned());
             }
@@ -336,6 +734,10 @@ where
         }
 
         for (index, attachment) in attachments.iter_mut().enumerate() {
+            if crate::audio::is_audio_attachment(attachment) {
+                continue;
+            }
+
             match self
                 .import_attachment(chat_id, message_id, index, attachment)
                 .await
@@ -410,16 +812,89 @@ where
         result
     }
 
+    async fn prepare_urls(&self, message: &mut IncomingMessage) {
+        let Some(url_ingestor) = &self.url_ingestor else {
+            return;
+        };
+
+        let urls = crate::url::detect_urls(&message.text);
+        if urls.is_empty() {
+            return;
+        }
+
+        for (index, result) in url_ingestor
+            .snapshots_for_text(message.message_id, &message.text)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            match result {
+                Ok(snapshot) => {
+                    let note_url = snapshot.original_url.clone();
+                    let import_result = self
+                        .runtime
+                        .import_chat_attachment(
+                            message.chat_id,
+                            &snapshot.host_path,
+                            &snapshot.workspace_path,
+                        )
+                        .await;
+                    match import_result {
+                        Ok(()) => {
+                            message.context_notes.push(format!(
+                                "URL context: {} ({}) saved at @{}",
+                                snapshot.title.as_deref().unwrap_or("untitled page"),
+                                snapshot.final_url,
+                                snapshot.workspace_path
+                            ));
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                chat_id = ?message.chat_id,
+                                message_id = ?message.message_id,
+                                url = %note_url,
+                                error = %err,
+                                "failed to import URL snapshot"
+                            );
+                            message
+                                .context_notes
+                                .push(format!("URL skipped: {note_url} ({err})"));
+                        }
+                    }
+                    remove_temp_file(&snapshot.host_path, "temporary URL snapshot").await;
+                }
+                Err(reason) => {
+                    let url = urls
+                        .get(index)
+                        .map(|url| url.as_str())
+                        .unwrap_or("unknown URL");
+                    tracing::warn!(
+                        chat_id = ?message.chat_id,
+                        message_id = ?message.message_id,
+                        url,
+                        error = %reason,
+                        "failed to ingest URL"
+                    );
+                    message
+                        .context_notes
+                        .push(format!("URL skipped: {url} ({reason})"));
+                }
+            }
+        }
+    }
+
     async fn enqueue_text(
         &self,
         chat_id: crate::ids::ChatId,
         prompt: impl Into<String>,
+        audio_reply: Option<crate::audio::AudioReplyRequest>,
     ) -> Result<(), AppError> {
         let receipt = self
             .router
             .enqueue(GroupWorkItem {
                 chat_id,
                 prompt: prompt.into(),
+                audio_reply,
             })
             .await?;
         if self.queue_ack_enabled && receipt.queue_position > 0 {
@@ -433,6 +908,36 @@ where
             .await?;
         }
         Ok(())
+    }
+}
+
+fn handle_skipped_audio(
+    attachment: &mut IncomingAttachment,
+    context_notes: &mut Vec<String>,
+    workspace_path: Option<&str>,
+    first_audio_failure: &mut Option<String>,
+    reason: String,
+) {
+    attachment.skipped_reason = Some(reason.clone());
+    if first_audio_failure.is_none() {
+        *first_audio_failure = Some(reason.clone());
+    }
+
+    match workspace_path {
+        Some(workspace_path) => context_notes.push(format!(
+            "Audio transcript from @{workspace_path} skipped: {reason}"
+        )),
+        None => context_notes.push(format!(
+            "Audio transcript for {} skipped: {reason}",
+            audio_attachment_label(attachment)
+        )),
+    }
+}
+
+fn audio_attachment_label(attachment: &IncomingAttachment) -> String {
+    match &attachment.file_name {
+        Some(file_name) => format!("{} `{file_name}`", attachment.kind.as_str()),
+        None => attachment.kind.as_str().to_owned(),
     }
 }
 
@@ -451,28 +956,8 @@ fn attachment_workspace_path(
         "{workspace_dir}/msg-{}/{}-{}",
         message_id.0,
         index + 1,
-        sanitize_file_name(file_name)
+        crate::bot::message::sanitize_file_name(file_name)
     )
-}
-
-fn sanitize_file_name(file_name: &str) -> String {
-    let mut sanitized = String::with_capacity(file_name.len().min(128));
-    for ch in file_name.chars().take(128) {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-            sanitized.push(ch);
-        } else {
-            sanitized.push('_');
-        }
-    }
-
-    let sanitized = sanitized.trim_matches('_');
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
-        return "attachment".to_owned();
-    }
-    if sanitized.starts_with('.') {
-        return format!("attachment{sanitized}");
-    }
-    sanitized.to_owned()
 }
 
 fn temp_attachment_path(message_id: crate::ids::MessageId, index: usize) -> PathBuf {
@@ -480,17 +965,101 @@ fn temp_attachment_path(message_id: crate::ids::MessageId, index: usize) -> Path
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "telellm-upload-{}-{}-{index}-{nanos}",
+        "telellm-upload-{}-{}-{index}-{nanos}-{counter}",
         std::process::id(),
         message_id.0
     ))
 }
 
+fn temp_audio_transcript_path(message_id: crate::ids::MessageId, index: usize) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "telellm-stt-{}-{}-{index}-{nanos}-{counter}.txt",
+        std::process::id(),
+        message_id.0
+    ))
+}
+
+async fn remove_temp_file(path: &Path, description: &str) {
+    if let Err(err) = tokio::fs::remove_file(path).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            error = %err,
+            path = %path.display(),
+            description,
+            "failed to remove temporary file"
+        );
+    }
+}
+
+struct VoiceModeAudioReplySynthesizer<M> {
+    settings: Arc<M>,
+    inner: Arc<dyn crate::audio::AudioReplySynthesizer>,
+}
+
+impl<M> VoiceModeAudioReplySynthesizer<M> {
+    fn new(settings: Arc<M>, inner: Arc<dyn crate::audio::AudioReplySynthesizer>) -> Self {
+        Self { settings, inner }
+    }
+}
+
+#[async_trait]
+impl<M> crate::audio::AudioReplySynthesizer for VoiceModeAudioReplySynthesizer<M>
+where
+    M: ChatSettingsStore + 'static,
+{
+    async fn synthesize_reply(
+        &self,
+        request: crate::audio::AudioReplyRequest,
+    ) -> Result<Option<crate::audio::SynthesizedAudio>, crate::audio::AudioError> {
+        if !self.voice_replies_enabled(request.chat_id).await {
+            return Ok(None);
+        }
+
+        let audio = self.inner.synthesize_reply(request.clone()).await?;
+        let Some(audio) = audio else {
+            return Ok(None);
+        };
+
+        if !self.voice_replies_enabled(request.chat_id).await {
+            remove_temp_file(&audio.host_path, "temporary spoken reply").await;
+            return Ok(None);
+        }
+
+        Ok(Some(audio))
+    }
+}
+
+impl<M> VoiceModeAudioReplySynthesizer<M>
+where
+    M: ChatSettingsStore + 'static,
+{
+    async fn voice_replies_enabled(&self, chat_id: crate::ids::ChatId) -> bool {
+        match self.settings.voice_replies_enabled(chat_id).await {
+            Ok(enabled) => enabled,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    chat_id = ?chat_id,
+                    "failed to read chat voice setting before spoken reply"
+                );
+                false
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl<M, S, T, N> IncomingMessageHandler for AppCore<M, S, T, N>
 where
-    M: MemoryStore + 'static,
+    M: MemoryStore + ChatSettingsStore + 'static,
     S: crate::codex::session::CodexSession + 'static,
     T: crate::bot::telegram::TelegramSink + 'static,
     N: RuntimeControl + 'static,
@@ -524,10 +1093,12 @@ pub enum AppError {
     Runtime(#[from] crate::runtime::RuntimeError),
     #[error("telegram error: {0}")]
     Telegram(#[from] TelegramError),
+    #[error("audio error: {0}")]
+    Audio(String),
 }
 
 fn help_text() -> &'static str {
-    "Show concise help for /status /reset /restart /rebuild /memory /remember /forget."
+    "Show concise help for /status /reset /restart /rebuild /memory /remember /forget /voice /summarize."
 }
 
 fn user_visible_error(error: &AppError) -> Option<&'static str> {
@@ -537,6 +1108,9 @@ fn user_visible_error(error: &AppError) -> Option<&'static str> {
         }
         AppError::Router(_) => {
             Some("I could not queue that request for Codex. Check the daemon logs for details.")
+        }
+        AppError::Audio(_) => {
+            Some("I could not transcribe that audio message. Check the daemon logs for details.")
         }
         AppError::Command(_) | AppError::Memory(_) | AppError::Telegram(_) => None,
     }
@@ -570,12 +1144,13 @@ mod tests {
         bot::telegram::{TelegramError, TelegramSink},
         codex::session::{CodexRequest, CodexSession, CodexSessionError, CodexTurn},
         ids::{ChatId, MessageId, UserId},
+        memory::store::ChatSettingsStore,
         memory::{MemoryKind, MemoryRecord, MemoryStoreError},
     };
     use async_trait::async_trait;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::{
         sync::mpsc,
@@ -590,10 +1165,25 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             attachments: Vec::new(),
+            context_notes: Vec::new(),
             reply_to_bot: false,
             reply_to: None,
             private_chat: false,
         }
+    }
+
+    fn incoming_voice(text: &str, file_size: u64) -> IncomingMessage {
+        let mut message = incoming(text);
+        message.private_chat = true;
+        message.attachments.push(IncomingAttachment::new(
+            AttachmentKind::Voice,
+            "voice-file-id".to_owned(),
+            "voice-unique-id".to_owned(),
+            Some("voice.ogg".to_owned()),
+            Some("audio/ogg".to_owned()),
+            file_size,
+        ));
+        message
     }
 
     fn test_system_prompt() -> String {
@@ -608,6 +1198,10 @@ mod tests {
             queue_ack_enabled,
             attachments: AttachmentConfig::default(),
             outputs: OutputConfig::default(),
+            audio: AudioConfig::default(),
+            audio_stt: None,
+            audio_tts: None,
+            url_ingestor: None,
         }
     }
 
@@ -710,6 +1304,79 @@ mod tests {
         assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
         assert_eq!(app.memory_store.remembered.load(Ordering::SeqCst), 1);
         assert!(messages.recv().await.expect("reply").contains("Remembered"));
+    }
+
+    #[tokio::test]
+    async fn summarize_should_enqueue_recent_chat_without_memory_write() {
+        let (app, runtime, mut messages) = app_with_fakes().await;
+
+        app.handle_message(incoming("the deploy is blocked"))
+            .await
+            .expect("ambient should store");
+        app.handle_message(incoming("/summarize deploy"))
+            .await
+            .expect("summarize should work");
+
+        let prompt = messages
+            .recv()
+            .await
+            .expect("summary prompt should be echoed");
+        assert!(prompt.contains("catch-up recap"));
+        assert!(prompt.contains("the deploy is blocked"));
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.memory_store.remembered.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn summarize_should_use_pre_command_recent_chat_with_capacity_one() {
+        let (app, runtime, mut messages) = app_with_fakes_and_rolling_capacity(1).await;
+
+        app.handle_message(incoming("the deploy is blocked"))
+            .await
+            .expect("ambient should store");
+        app.handle_message(incoming("/summarize@telellm_bot deploy"))
+            .await
+            .expect("summarize should work");
+
+        let prompt = messages
+            .recv()
+            .await
+            .expect("summary prompt should be echoed");
+        assert!(prompt.contains("catch-up recap"));
+        assert!(prompt.contains("the deploy is blocked"));
+        assert!(!prompt.contains("/summarize"));
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn summarize_without_recent_chat_should_not_start_runtime() {
+        let (app, runtime, mut messages) = app_with_failing_runtime().await;
+
+        app.handle_message(incoming("/summarize"))
+            .await
+            .expect("empty summarize should reply locally");
+
+        let reply = messages.recv().await.expect("reply should be sent");
+        assert_eq!(reply, "There is not enough recent chat to summarize.");
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_off_should_persist_chat_setting_without_runtime() {
+        let (app, runtime, mut messages) = app_with_fakes().await;
+
+        app.handle_message(incoming("/voice off"))
+            .await
+            .expect("voice command should work");
+
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+        assert!(messages.recv().await.expect("reply").contains("off"));
+        assert!(
+            !app.memory_store
+                .voice_replies_enabled(ChatId(1))
+                .await
+                .expect("setting should load")
+        );
     }
 
     #[tokio::test]
@@ -849,6 +1516,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn addressed_message_should_ingest_url_context() {
+        let (app, runtime, mut messages) = app_with_fakes_and_url_snapshot(
+            "https://example.com/",
+            "web_pages/msg-1/1-example.com.md",
+            "# Example\n\nReadable page text",
+        )
+        .await;
+
+        app.handle_message(incoming("@telellm_bot read https://example.com/"))
+            .await
+            .expect("message should be handled");
+
+        let prompt = messages.recv().await.expect("prompt");
+        let imported = runtime.imported.lock().await;
+        assert_eq!(
+            imported[0].workspace_path,
+            "web_pages/msg-1/1-example.com.md"
+        );
+        assert!(prompt.contains("URL context"));
+        assert!(prompt.contains("@web_pages/msg-1/1-example.com.md"));
+    }
+
+    #[tokio::test]
     async fn addressed_message_should_import_replied_attachment() {
         let (app, runtime, mut messages) = app_with_fakes().await;
         let mut message = incoming("@telellm_bot what is this?");
@@ -864,6 +1554,7 @@ mod tests {
                 Some("image/png".to_owned()),
                 15,
             )],
+            context_notes: Vec::new(),
         });
 
         app.handle_message(message)
@@ -881,12 +1572,307 @@ mod tests {
         assert!(response.contains("available at @telegram_uploads/msg-7/1-diagram.png"));
     }
 
+    #[tokio::test]
+    async fn addressed_voice_should_import_transcribe_and_render_context() {
+        let (app, runtime, mut messages) =
+            app_with_fakes_and_audio_stt("hello from the voice note").await;
+        let message = incoming_voice("@telellm_bot", 15);
+
+        app.handle_message(message)
+            .await
+            .expect("voice message should be handled");
+
+        let prompt = messages
+            .recv()
+            .await
+            .expect("Codex prompt should be echoed");
+        let imported = runtime.imported.lock().await;
+        assert_eq!(
+            imported[0].workspace_path,
+            "telegram_audio/msg-1/1-voice.ogg"
+        );
+        assert!(prompt.contains("hello from the voice note"));
+        assert!(prompt.contains("@telegram_audio/msg-1/1-voice.ogg"));
+    }
+
+    #[tokio::test]
+    async fn voice_only_stt_failure_should_send_audio_error_without_codex_prompt() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_fakes_and_audio_stt_failure(false).await;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_only_reply_context_stt_failure_should_send_audio_error_without_codex_prompt() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_fakes_and_audio_stt_failure(false).await;
+        let mut message = incoming_voice("", 15);
+        message.reply_to = Some(crate::bot::message::RepliedMessage {
+            message_id: MessageId(7),
+            from_name: Some("Mike".to_owned()),
+            text: "here is the context I am replying to".to_owned(),
+            attachments: Vec::new(),
+            context_notes: Vec::new(),
+        });
+
+        IncomingMessageHandler::handle_message(&app, message).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_only_trigger_failure_with_replied_audio_transcript_should_send_audio_error() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_trigger_stt_failure_and_reply_stt_success().await;
+        let mut message = incoming_voice("", 15);
+        message.reply_to = Some(crate::bot::message::RepliedMessage {
+            message_id: MessageId(7),
+            from_name: Some("Mike".to_owned()),
+            text: String::new(),
+            attachments: vec![IncomingAttachment::new(
+                AttachmentKind::Voice,
+                "reply-voice-file-id".to_owned(),
+                "reply-voice-unique-id".to_owned(),
+                Some("reply.ogg".to_owned()),
+                Some("audio/ogg".to_owned()),
+                15,
+            )],
+            context_notes: Vec::new(),
+        });
+
+        IncomingMessageHandler::handle_message(&app, message).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn text_with_stt_failure_should_queue_with_skipped_context_note() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_fakes_and_audio_stt_failure(false).await;
+
+        app.handle_message(incoming_voice("@telellm_bot use the caption", 15))
+            .await
+            .expect("text plus failed audio should still queue");
+
+        let prompt = messages
+            .recv()
+            .await
+            .expect("Codex prompt should be echoed");
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 1);
+        assert!(prompt.contains("@telellm_bot use the caption"));
+        assert!(
+            prompt.contains("Audio transcript from @telegram_audio/msg-1/1-voice.ogg skipped:")
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_only_disabled_audio_should_send_audio_error_without_codex_prompt() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_audio_failure_config(|config| config.audio.enabled = false, false).await;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_only_disabled_audio_should_not_start_runtime() {
+        let (mut app, runtime, mut messages) = app_with_failing_runtime().await;
+        app.audio.enabled = false;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_only_unconfigured_stt_should_not_start_runtime() {
+        let (app, runtime, mut messages) = app_with_failing_runtime().await;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_only_oversized_audio_should_not_start_runtime() {
+        let (mut app, runtime, mut messages) = app_with_failing_runtime().await;
+        app.audio.max_file_bytes = 10;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_only_oversized_audio_should_send_audio_error_without_codex_prompt() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_audio_failure_config(|config| config.audio.max_file_bytes = 10, false).await;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_only_download_failed_audio_should_send_audio_error_without_codex_prompt() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_audio_failure_config(|_| {}, true).await;
+
+        IncomingMessageHandler::handle_message(&app, incoming_voice("", 15)).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_off_should_suppress_in_flight_spoken_reply() {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, mut messages, mut audio_files) = FakeTelegram::new_with_audio();
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let codex = Arc::new(BlockingCodexSession::new(entered_tx));
+        let synthesizer = Arc::new(CountingAudioReplySynthesizer::default());
+        let router = Arc::new(Router::new_with_audio_replies(
+            4,
+            telegram,
+            crate::config::TelegramUxConfig::default(),
+            Arc::new(VoiceModeAudioReplySynthesizer::new(
+                memory.clone(),
+                synthesizer.clone(),
+            )),
+        ));
+        router.register_session(ChatId(1), 1, codex.clone()).await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let mut config = app_core_config(Vec::new(), true);
+        config.audio_stt = Some(Arc::new(success_stt("voice transcript")));
+        config.audio_tts = Some(Arc::new(crate::audio::LocalTts::new(
+            crate::config::AudioTtsConfig {
+                command: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf unused > \"$1\"".to_owned(),
+                    "test-sh".to_owned(),
+                    "{output}".to_owned(),
+                ],
+                stdin_text: true,
+                timeout_secs: 5,
+                send_as: crate::config::AudioSendAs::Voice,
+            },
+        )));
+        let app = AppCore::new(
+            config,
+            memory.clone(),
+            RollingBuffer::new(10),
+            router,
+            runtime,
+        );
+
+        app.handle_message(incoming_voice("@telellm_bot", 15))
+            .await
+            .expect("voice message should queue");
+        timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("Codex turn should start")
+            .expect("blocking session should receive prompt");
+        app.handle_message(incoming("/voice off"))
+            .await
+            .expect("voice off should work");
+        codex.release.notify_waiters();
+
+        let voice_reply = timeout(Duration::from_secs(1), messages.recv())
+            .await
+            .expect("voice off reply should arrive")
+            .expect("telegram sender should stay open");
+        assert!(voice_reply.contains("off"), "{voice_reply}");
+        let codex_text = timeout(Duration::from_secs(1), messages.recv())
+            .await
+            .expect("Codex text should arrive")
+            .expect("telegram sender should stay open");
+        assert!(codex_text.contains("voice transcript"));
+        assert!(matches!(
+            audio_files.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(synthesizer.calls.load(Ordering::SeqCst), 0);
+    }
+
     async fn app_with_fakes() -> (
         AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
         Arc<FakeRuntime>,
         mpsc::UnboundedReceiver<String>,
     ) {
         let (app, runtime, messages, _codex) = app_with_fakes_and_session().await;
+        (app, runtime, messages)
+    }
+
+    async fn app_with_fakes_and_rolling_capacity(
+        capacity: usize,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, messages) = FakeTelegram::new();
+        let router = Arc::new(Router::new(4, telegram));
+        router
+            .register_session(ChatId(1), 1, Arc::new(FakeCodexSession::default()))
+            .await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let app = AppCore::new(
+            app_core_config(Vec::new(), true),
+            memory,
+            RollingBuffer::new(capacity),
+            router,
+            runtime.clone(),
+        );
         (app, runtime, messages)
     }
 
@@ -910,6 +1896,178 @@ mod tests {
             runtime.clone(),
         );
         (app, runtime, messages, codex)
+    }
+
+    async fn app_with_fakes_and_audio_stt(
+        transcript: &str,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, messages) = FakeTelegram::new();
+        let router = Arc::new(Router::new(4, telegram));
+        router
+            .register_session(ChatId(1), 1, Arc::new(FakeCodexSession::default()))
+            .await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let mut config = app_core_config(Vec::new(), true);
+        config.audio_stt = Some(Arc::new(success_stt(transcript)));
+        let app = AppCore::new(
+            config,
+            memory,
+            RollingBuffer::new(10),
+            router,
+            runtime.clone(),
+        );
+        (app, runtime, messages)
+    }
+
+    async fn app_with_fakes_and_url_snapshot(
+        url: &str,
+        workspace_path: &str,
+        contents: &str,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, messages) = FakeTelegram::new();
+        let router = Arc::new(Router::new(4, telegram));
+        router
+            .register_session(ChatId(1), 1, Arc::new(FakeCodexSession::default()))
+            .await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let host_path = temp_attachment_path(MessageId(1), 99);
+        tokio::fs::write(&host_path, contents)
+            .await
+            .expect("fake URL snapshot should write");
+        let mut config = app_core_config(Vec::new(), true);
+        config.url_ingestor = Some(Arc::new(FakeUrlContextProvider {
+            snapshot: crate::url::UrlSnapshot {
+                original_url: url.to_owned(),
+                final_url: url.to_owned(),
+                title: Some("Example".to_owned()),
+                status: 200,
+                content_type: Some("text/html".to_owned()),
+                bytes: contents.len(),
+                workspace_path: workspace_path.to_owned(),
+                host_path,
+            },
+        }));
+        let app = AppCore::new(
+            config,
+            memory,
+            RollingBuffer::new(10),
+            router,
+            runtime.clone(),
+        );
+        (app, runtime, messages)
+    }
+
+    async fn app_with_fakes_and_audio_stt_failure(
+        fail_download: bool,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+        Arc<FakeCodexSession>,
+    ) {
+        app_with_audio_failure_config(
+            |config| {
+                config.audio_stt = Some(Arc::new(crate::audio::LocalStt::new(
+                    crate::config::AudioToolConfig {
+                        command: "/bin/sh".to_owned(),
+                        args: vec![
+                            "-c".to_owned(),
+                            "exit 7".to_owned(),
+                            "test-sh".to_owned(),
+                            "{input}".to_owned(),
+                            "{output}".to_owned(),
+                        ],
+                        timeout_secs: 5,
+                    },
+                )));
+            },
+            fail_download,
+        )
+        .await
+    }
+
+    async fn app_with_trigger_stt_failure_and_reply_stt_success() -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+        Arc<FakeCodexSession>,
+    ) {
+        app_with_audio_failure_config(
+            |config| {
+                config.audio_stt = Some(Arc::new(crate::audio::LocalStt::new(
+                    crate::config::AudioToolConfig {
+                        command: "/bin/sh".to_owned(),
+                        args: vec![
+                            "-c".to_owned(),
+                            "if grep -q reply \"$2\"; then printf 'reply audio transcript' > \"$3\"; else exit 7; fi".to_owned(),
+                            "test-sh".to_owned(),
+                            "unused-transcript".to_owned(),
+                            "{input}".to_owned(),
+                            "{output}".to_owned(),
+                        ],
+                        timeout_secs: 5,
+                    },
+                )));
+            },
+            false,
+        )
+        .await
+    }
+
+    async fn app_with_audio_failure_config(
+        configure: impl FnOnce(&mut AppCoreConfig),
+        fail_download: bool,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+        Arc<FakeCodexSession>,
+    ) {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, messages) = if fail_download {
+            FakeTelegram::new_with_download_failure()
+        } else {
+            FakeTelegram::new()
+        };
+        let router = Arc::new(Router::new(4, telegram));
+        let codex = Arc::new(FakeCodexSession::default());
+        router.register_session(ChatId(1), 1, codex.clone()).await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let mut config = app_core_config(Vec::new(), true);
+        configure(&mut config);
+        let app = AppCore::new(
+            config,
+            memory,
+            RollingBuffer::new(10),
+            router,
+            runtime.clone(),
+        );
+        (app, runtime, messages, codex)
+    }
+
+    fn success_stt(transcript: &str) -> crate::audio::LocalStt {
+        crate::audio::LocalStt::new(crate::config::AudioToolConfig {
+            command: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf '%s' \"$1\" > \"$3\"".to_owned(),
+                "test-sh".to_owned(),
+                transcript.to_owned(),
+                "{input}".to_owned(),
+                "{output}".to_owned(),
+            ],
+            timeout_secs: 5,
+        })
     }
 
     async fn app_with_fakes_and_allowed_chats(
@@ -947,10 +2105,20 @@ mod tests {
         (app, runtime, messages)
     }
 
-    #[derive(Default)]
     struct FakeMemoryStore {
         forgotten: AtomicUsize,
         remembered: AtomicUsize,
+        voice_replies_enabled: AtomicBool,
+    }
+
+    impl Default for FakeMemoryStore {
+        fn default() -> Self {
+            Self {
+                forgotten: AtomicUsize::new(0),
+                remembered: AtomicUsize::new(0),
+                voice_replies_enabled: AtomicBool::new(true),
+            }
+        }
     }
 
     #[async_trait]
@@ -988,6 +2156,37 @@ mod tests {
         async fn forget_all(&self, _chat_id: ChatId) -> Result<u64, MemoryStoreError> {
             self.forgotten.fetch_add(1, Ordering::SeqCst);
             Ok(1)
+        }
+    }
+
+    #[async_trait]
+    impl ChatSettingsStore for FakeMemoryStore {
+        async fn voice_replies_enabled(&self, _chat_id: ChatId) -> Result<bool, MemoryStoreError> {
+            Ok(self.voice_replies_enabled.load(Ordering::SeqCst))
+        }
+
+        async fn set_voice_replies_enabled(
+            &self,
+            _chat_id: ChatId,
+            enabled: bool,
+        ) -> Result<(), MemoryStoreError> {
+            self.voice_replies_enabled.store(enabled, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct FakeUrlContextProvider {
+        snapshot: crate::url::UrlSnapshot,
+    }
+
+    #[async_trait]
+    impl crate::url::UrlContextProvider for FakeUrlContextProvider {
+        async fn snapshots_for_text(
+            &self,
+            _message_id: MessageId,
+            _text: &str,
+        ) -> Vec<Result<crate::url::UrlSnapshot, crate::url::UrlIngestionError>> {
+            vec![Ok(self.snapshot.clone())]
         }
     }
 
@@ -1038,14 +2237,75 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CountingAudioReplySynthesizer {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::audio::AudioReplySynthesizer for CountingAudioReplySynthesizer {
+        async fn synthesize_reply(
+            &self,
+            request: crate::audio::AudioReplyRequest,
+        ) -> Result<Option<crate::audio::SynthesizedAudio>, crate::audio::AudioError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let path = temp_attachment_path(request.trigger_message_id, 777);
+            tokio::fs::write(&path, request.text.as_bytes())
+                .await
+                .map_err(|source| crate::audio::AudioError::OutputRead {
+                    path: path.clone(),
+                    source,
+                })?;
+            Ok(Some(crate::audio::SynthesizedAudio {
+                host_path: path,
+                file_name: "reply.ogg".to_owned(),
+                send_as: crate::config::AudioSendAs::Voice,
+                bytes: request.text.len() as u64,
+            }))
+        }
+    }
+
     struct FakeTelegram {
         tx: mpsc::UnboundedSender<String>,
+        audio_tx: Option<mpsc::UnboundedSender<String>>,
+        fail_download: AtomicBool,
     }
 
     impl FakeTelegram {
         fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<String>) {
             let (tx, rx) = mpsc::unbounded_channel();
-            (Arc::new(Self { tx }), rx)
+            (
+                Arc::new(Self {
+                    tx,
+                    audio_tx: None,
+                    fail_download: AtomicBool::new(false),
+                }),
+                rx,
+            )
+        }
+
+        fn new_with_audio() -> (
+            Arc<Self>,
+            mpsc::UnboundedReceiver<String>,
+            mpsc::UnboundedReceiver<String>,
+        ) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (audio_tx, audio_rx) = mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    tx,
+                    audio_tx: Some(audio_tx),
+                    fail_download: AtomicBool::new(false),
+                }),
+                rx,
+                audio_rx,
+            )
+        }
+
+        fn new_with_download_failure() -> (Arc<Self>, mpsc::UnboundedReceiver<String>) {
+            let (telegram, rx) = Self::new();
+            telegram.fail_download.store(true, Ordering::SeqCst);
+            (telegram, rx)
         }
     }
 
@@ -1057,15 +2317,45 @@ mod tests {
                 .map_err(|err| TelegramError::Send(err.to_string()))
         }
 
+        async fn send_audio_file(
+            &self,
+            _chat_id: ChatId,
+            path: &std::path::Path,
+            _file_name: &str,
+            kind: crate::bot::telegram::TelegramAudioSendKind,
+        ) -> Result<crate::bot::telegram::TelegramMessageHandle, TelegramError> {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|err| TelegramError::AudioSend(err.to_string()))?;
+            let audio_tx = self.audio_tx.as_ref().ok_or_else(|| {
+                TelegramError::AudioSend("fake audio channel is not configured".to_owned())
+            })?;
+            audio_tx
+                .send(format!("{kind:?}: {}", String::from_utf8_lossy(&bytes)))
+                .map_err(|err| TelegramError::AudioSend(err.to_string()))?;
+            Ok(crate::bot::telegram::TelegramMessageHandle {
+                chat_id: _chat_id,
+                message_id: MessageId(999),
+            })
+        }
+
         async fn download_file_to_path(
             &self,
             _file_id: &str,
             destination: &std::path::Path,
         ) -> Result<u64, TelegramError> {
-            tokio::fs::write(destination, b"fake attachment bytes")
+            if self.fail_download.load(Ordering::SeqCst) {
+                return Err(TelegramError::Download("test download failure".to_owned()));
+            }
+            let bytes = if _file_id.contains("reply") {
+                b"fake reply attachment bytes".as_slice()
+            } else {
+                b"fake attachment bytes".as_slice()
+            };
+            tokio::fs::write(destination, bytes)
                 .await
                 .map_err(|err| TelegramError::Download(err.to_string()))?;
-            Ok(21)
+            Ok(bytes.len() as u64)
         }
     }
 

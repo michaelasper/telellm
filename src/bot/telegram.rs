@@ -74,6 +74,18 @@ pub trait TelegramSink: Send + Sync {
         ))
     }
 
+    async fn send_audio_file(
+        &self,
+        _chat_id: ChatId,
+        _path: &Path,
+        _file_name: &str,
+        _kind: TelegramAudioSendKind,
+    ) -> Result<TelegramMessageHandle, TelegramError> {
+        Err(TelegramError::AudioSend(
+            "telegram audio uploads are not supported by this sink".to_owned(),
+        ))
+    }
+
     async fn download_file_to_path(
         &self,
         _file_id: &str,
@@ -89,6 +101,12 @@ pub trait TelegramSink: Send + Sync {
 pub struct TelegramMessageHandle {
     pub chat_id: ChatId,
     pub message_id: MessageId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramAudioSendKind {
+    Voice,
+    Audio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +140,8 @@ pub enum TelegramError {
     Download(String),
     #[error("telegram document send failed: {0}")]
     DocumentSend(String),
+    #[error("telegram audio send failed: {0}")]
+    AudioSend(String),
     #[error("telegram command registration failed: {0}")]
     CommandRegistration(String),
 }
@@ -363,6 +383,34 @@ impl TelegramSink for TeloxideTelegramSink {
         })
     }
 
+    async fn send_audio_file(
+        &self,
+        chat_id: ChatId,
+        path: &Path,
+        file_name: &str,
+        kind: TelegramAudioSendKind,
+    ) -> Result<TelegramMessageHandle, TelegramError> {
+        let input = InputFile::file(path.to_path_buf()).file_name(file_name.to_owned());
+        let message =
+            match kind {
+                TelegramAudioSendKind::Voice => self
+                    .bot
+                    .send_voice(TgChatId(chat_id.0), input)
+                    .await
+                    .map_err(|err| TelegramError::AudioSend(err.to_string()))?,
+                TelegramAudioSendKind::Audio => self
+                    .bot
+                    .send_audio(TgChatId(chat_id.0), input)
+                    .await
+                    .map_err(|err| TelegramError::AudioSend(err.to_string()))?,
+            };
+
+        Ok(TelegramMessageHandle {
+            chat_id,
+            message_id: MessageId(message.id.0),
+        })
+    }
+
     async fn download_file_to_path(
         &self,
         file_id: &str,
@@ -560,6 +608,7 @@ fn normalize_message(
         from_name,
         text,
         attachments,
+        context_notes: Vec::new(),
         reply_to_bot,
         reply_to,
         private_chat: message.chat.is_private(),
@@ -578,6 +627,28 @@ fn message_attachments(message: &Message) -> Vec<IncomingAttachment> {
             Some("photo.jpg".to_owned()),
             Some("image/jpeg".to_owned()),
             u64::from(photo.file.size),
+        )];
+    }
+
+    if let Some(voice) = message.voice() {
+        return vec![IncomingAttachment::new(
+            AttachmentKind::Voice,
+            voice.file.id.0.clone(),
+            voice.file.unique_id.0.clone(),
+            Some("voice.ogg".to_owned()),
+            voice.mime_type.as_ref().map(ToString::to_string),
+            u64::from(voice.file.size),
+        )];
+    }
+
+    if let Some(audio) = message.audio() {
+        return vec![IncomingAttachment::new(
+            AttachmentKind::Audio,
+            audio.file.id.0.clone(),
+            audio.file.unique_id.0.clone(),
+            audio.file_name.clone(),
+            audio.mime_type.as_ref().map(ToString::to_string),
+            u64::from(audio.file.size),
         )];
     }
 
@@ -611,6 +682,7 @@ fn normalize_replied_message(message: &Message) -> Option<crate::bot::message::R
         from_name: message.from.as_ref().map(display_name),
         text,
         attachments,
+        context_notes: Vec::new(),
     })
 }
 
@@ -707,5 +779,11 @@ mod tests {
             .any(|command| command.command == "remember");
 
         assert!(has_remember);
+    }
+
+    #[test]
+    fn telegram_audio_send_kind_should_compare() {
+        assert_eq!(TelegramAudioSendKind::Voice, TelegramAudioSendKind::Voice);
+        assert_ne!(TelegramAudioSendKind::Voice, TelegramAudioSendKind::Audio);
     }
 }

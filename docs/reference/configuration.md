@@ -60,6 +60,74 @@ All fields are optional. The section controls files Codex creates in the chat wo
 
 `workspace_dir` must be a non-empty relative path without parent directory components. `max_file_bytes` and `max_files_per_response` must be greater than zero.
 
+## `[audio]`
+
+All fields are optional. The section controls inbound audio transcription and optional spoken replies.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | Enables inbound Telegram voice/audio processing and is required for voice/audio-triggered spoken replies. |
+| `replies_enabled` | boolean | `true` | Allows chats to receive synthesized spoken replies when TTS is configured and chat voice mode allows it. |
+| `workspace_dir` | string | `telegram_audio` | Relative directory under `/workspace` where imported audio artifacts are stored. |
+| `max_file_bytes` | integer | `20000000` | Maximum Telegram audio file size to download for transcription and maximum generated TTS output size. |
+
+`workspace_dir` must be a non-empty relative path without parent directory components. `max_file_bytes` must be greater than zero and at most `20000000`, matching Telegram Bot API download limits. STT and TTS command subsections are optional.
+
+Audio defaults to enabled, but STT and TTS are unavailable unless their command subsections are configured. `/voice status` reports the effective runtime state: global audio, global spoken replies, the chat's voice mode, STT availability, and TTS availability.
+
+When `enabled = false`, Telegram voice/audio attachments are not transcribed. When `replies_enabled = false`, `/voice on` cannot enable spoken replies for a chat.
+
+## `[audio.stt]`
+
+Optional local speech-to-text command configuration.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `command` | string | `whisper-cli` | Local command used to transcribe downloaded audio. |
+| `args` | array of strings | `["--model", "/models/ggml-base.en.bin", "--file", "{input}", "--output-txt", "{output}"]` | Arguments passed to the STT command. `{input}` is the host path to source audio and `{output}` is where transcript text should be written. |
+| `timeout_secs` | integer | `120` | Maximum time to wait for the STT command. |
+
+`command` must not be empty. `timeout_secs` must be greater than zero.
+
+The command runs on the host. Arguments are passed as configured after replacing `{input}` with the downloaded Telegram audio path and `{output}` with the transcript path. The command must create a non-empty text file at `{output}`.
+
+## `[audio.tts]`
+
+Optional local text-to-speech command configuration.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `command` | string | `piper` | Local command used to synthesize spoken replies. |
+| `args` | array of strings | `["--model", "/models/en_US-lessac-medium.onnx", "--output_file", "{output}"]` | Arguments passed to the TTS command. `{output}` is where generated audio should be written. |
+| `stdin_text` | boolean | `true` | Writes the final Codex text to the TTS command's standard input. |
+| `timeout_secs` | integer | `120` | Maximum time to wait for the TTS command. |
+| `send_as` | string | `voice` | Telegram upload mode for generated speech. Valid values are `voice` and `audio`. |
+
+`command` must not be empty. `timeout_secs` must be greater than zero.
+
+The command runs on the host after the final text response has been sent. Arguments are passed as configured after replacing `{output}` with the generated audio path. When `stdin_text = true`, the final Codex text is written to the command's standard input. `send_as = "voice"` uses Telegram voice upload; `send_as = "audio"` uses Telegram audio upload.
+
+## `[url_ingestion]`
+
+All fields are optional. The section controls bounded fetching of URLs from addressed messages and DMs.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | Enables URL fetching and readable-content extraction for addressed messages. |
+| `workspace_dir` | string | `web_pages` | Relative directory under `/workspace` where fetched page snapshots are stored. |
+| `max_urls_per_message` | integer | `3` | Maximum URLs to fetch from one Telegram message. |
+| `max_fetch_bytes` | integer | `2000000` | Maximum response bytes to read for one URL. |
+| `timeout_secs` | integer | `20` | Maximum time to wait for each URL fetch. |
+| `user_agent` | string | `telellm/0.1` | User-Agent sent with URL fetch requests. |
+
+`workspace_dir` must be a non-empty relative path without parent directory components. `user_agent` must not be empty. `max_urls_per_message`, `max_fetch_bytes`, and `timeout_secs` must be greater than zero.
+
+Only `http` and `https` URLs are considered. At most `max_urls_per_message` URLs are fetched from one message. Fetches read at most `max_fetch_bytes` response bytes, accept `text/html` and `text/*` responses, and write readable snapshots under `/workspace/<url_ingestion.workspace_dir>/msg-<message-id>/`.
+
+URL fetching disables proxies and automatic redirects. The daemon resolves and validates each request hop, follows up to five redirects manually, validates every redirect target before connecting, and pins each fetch to the validated resolved socket addresses. Resolved loopback, private, link-local, multicast, carrier-grade NAT, benchmark, documentation, reserved, and other non-public or special IPv4/IPv6 ranges are blocked.
+
+Fetch, parse, content-type, redirect, and safety failures are rendered into prompt context as skipped URL notes. They do not stop a normal text response.
+
 ## `[prompt]`
 
 | Field | Type | Required | Default In Example | Description |

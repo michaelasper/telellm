@@ -8,6 +8,7 @@ pub struct IncomingMessage {
     pub from_name: Option<String>,
     pub text: String,
     pub attachments: Vec<IncomingAttachment>,
+    pub context_notes: Vec<String>,
     pub reply_to_bot: bool,
     pub reply_to: Option<RepliedMessage>,
     pub private_chat: bool,
@@ -51,6 +52,8 @@ impl IncomingAttachment {
 pub enum AttachmentKind {
     Photo,
     Document,
+    Voice,
+    Audio,
 }
 
 impl AttachmentKind {
@@ -58,6 +61,8 @@ impl AttachmentKind {
         match self {
             Self::Photo => "photo",
             Self::Document => "document",
+            Self::Voice => "voice",
+            Self::Audio => "audio",
         }
     }
 
@@ -65,7 +70,13 @@ impl AttachmentKind {
         match self {
             Self::Photo => "photo.jpg",
             Self::Document => "document",
+            Self::Voice => "voice.ogg",
+            Self::Audio => "audio",
         }
+    }
+
+    pub fn is_audio(self) -> bool {
+        matches!(self, Self::Voice | Self::Audio)
     }
 }
 
@@ -75,6 +86,7 @@ pub struct RepliedMessage {
     pub from_name: Option<String>,
     pub text: String,
     pub attachments: Vec<IncomingAttachment>,
+    pub context_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +113,26 @@ fn mentions_bot(text: &str, bot_username: &str) -> bool {
     })
 }
 
+pub fn sanitize_file_name(file_name: &str) -> String {
+    let mut sanitized = String::with_capacity(file_name.len().min(128));
+    for ch in file_name.chars().take(128) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return "attachment".to_owned();
+    }
+    if sanitized.starts_with('.') {
+        return format!("attachment{sanitized}");
+    }
+    sanitized.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +145,7 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             attachments: Vec::new(),
+            context_notes: Vec::new(),
             reply_to_bot: false,
             reply_to: None,
             private_chat: false,
@@ -154,5 +187,21 @@ mod tests {
         msg.private_chat = true;
 
         assert_eq!(msg.addressing("telellm_bot"), Addressing::Addressed);
+    }
+
+    #[test]
+    fn attachment_kind_should_identify_audio() {
+        assert!(AttachmentKind::Voice.is_audio());
+        assert!(AttachmentKind::Audio.is_audio());
+        assert!(!AttachmentKind::Photo.is_audio());
+        assert!(!AttachmentKind::Document.is_audio());
+    }
+
+    #[test]
+    fn attachment_kind_should_name_audio_defaults() {
+        assert_eq!(AttachmentKind::Voice.as_str(), "voice");
+        assert_eq!(AttachmentKind::Audio.as_str(), "audio");
+        assert_eq!(AttachmentKind::Voice.default_file_name(), "voice.ogg");
+        assert_eq!(AttachmentKind::Audio.default_file_name(), "audio");
     }
 }

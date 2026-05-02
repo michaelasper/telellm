@@ -60,6 +60,7 @@ fn push_message_line(output: &mut String, message: &IncomingMessage) {
     }
     output.push('\n');
     push_attachments(output, &message.attachments);
+    push_context_notes(output, &message.context_notes);
 }
 
 fn push_attachments(output: &mut String, attachments: &[crate::bot::message::IncomingAttachment]) {
@@ -92,6 +93,14 @@ fn push_attachments(output: &mut String, attachments: &[crate::bot::message::Inc
     }
 }
 
+fn push_context_notes(output: &mut String, notes: &[String]) {
+    for note in notes {
+        output.push_str("  context: ");
+        output.push_str(note);
+        output.push('\n');
+    }
+}
+
 fn push_replied_message_line(output: &mut String, message: &crate::bot::message::RepliedMessage) {
     let name = message.from_name.as_deref().unwrap_or("unknown");
     output.push_str("- ");
@@ -104,6 +113,7 @@ fn push_replied_message_line(output: &mut String, message: &crate::bot::message:
     }
     output.push('\n');
     push_attachments(output, &message.attachments);
+    push_context_notes(output, &message.context_notes);
 }
 
 #[cfg(test)]
@@ -123,6 +133,7 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             attachments: Vec::new(),
+            context_notes: Vec::new(),
             reply_to_bot: false,
             reply_to: None,
             private_chat: false,
@@ -171,6 +182,7 @@ mod tests {
             from_name: Some("beru".to_owned()),
             text: "Of course I know about the commune, Nick.".to_owned(),
             attachments: Vec::new(),
+            context_notes: Vec::new(),
         });
         let packet = ContextPacket {
             system_prompt: "Answer the trigger.".to_owned(),
@@ -183,6 +195,25 @@ mod tests {
 
         assert!(rendered.contains("Reply context:\n- beru: Of course I know about the commune"));
         assert!(rendered.contains("Triggering message:\n- Mike: HUAC?"));
+    }
+
+    #[test]
+    fn render_should_include_context_notes() {
+        let mut trigger = message("@telellm_bot");
+        trigger.context_notes.push(
+            "Audio transcript from @telegram_audio/msg-1/1-voice.ogg: hello there".to_owned(),
+        );
+        let packet = ContextPacket {
+            system_prompt: "Answer the trigger.".to_owned(),
+            triggering_message: trigger,
+            recent_messages: Vec::new(),
+            memories: Vec::new(),
+        };
+
+        let rendered = packet.render();
+
+        assert!(rendered.contains("Audio transcript from @telegram_audio/msg-1/1-voice.ogg"));
+        assert!(rendered.contains("hello there"));
     }
 
     #[test]

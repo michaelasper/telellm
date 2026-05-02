@@ -1,4 +1,4 @@
-use super::store::{MemoryKind, MemoryRecord, MemoryStore, MemoryStoreError};
+use super::store::{ChatSettingsStore, MemoryKind, MemoryRecord, MemoryStore, MemoryStoreError};
 use crate::ids::{ChatId, UserId};
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
@@ -39,6 +39,17 @@ impl SqliteMemoryStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_chat_id ON memories(chat_id)")
             .execute(&self.pool)
             .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id INTEGER PRIMARY KEY,
+                voice_replies_enabled INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -116,6 +127,39 @@ impl MemoryStore for SqliteMemoryStore {
     }
 }
 
+#[async_trait]
+impl ChatSettingsStore for SqliteMemoryStore {
+    async fn voice_replies_enabled(&self, chat_id: ChatId) -> Result<bool, MemoryStoreError> {
+        let row = sqlx::query("SELECT voice_replies_enabled FROM chat_settings WHERE chat_id = ?1")
+            .bind(chat_id.0)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row
+            .map(|row| row.get::<i64, _>("voice_replies_enabled") != 0)
+            .unwrap_or(true))
+    }
+
+    async fn set_voice_replies_enabled(
+        &self,
+        chat_id: ChatId,
+        enabled: bool,
+    ) -> Result<(), MemoryStoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO chat_settings (chat_id, voice_replies_enabled)
+            VALUES (?1, ?2)
+            ON CONFLICT(chat_id) DO UPDATE SET voice_replies_enabled = excluded.voice_replies_enabled
+            "#,
+        )
+        .bind(chat_id.0)
+        .bind(if enabled { 1_i64 } else { 0_i64 })
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +211,44 @@ mod tests {
             .await
             .expect("delete should work");
         assert_eq!(removed, 1);
+    }
+
+    #[tokio::test]
+    async fn voice_replies_should_default_to_enabled() {
+        let store = SqliteMemoryStore::connect("sqlite::memory:")
+            .await
+            .expect("store should connect");
+
+        assert!(
+            store
+                .voice_replies_enabled(ChatId(1))
+                .await
+                .expect("settings should load")
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_replies_should_persist_per_chat() {
+        let store = SqliteMemoryStore::connect("sqlite::memory:")
+            .await
+            .expect("store should connect");
+
+        store
+            .set_voice_replies_enabled(ChatId(1), false)
+            .await
+            .expect("setting should save");
+
+        assert!(
+            !store
+                .voice_replies_enabled(ChatId(1))
+                .await
+                .expect("setting should load")
+        );
+        assert!(
+            store
+                .voice_replies_enabled(ChatId(2))
+                .await
+                .expect("other chat should use default")
+        );
     }
 }
