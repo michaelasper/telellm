@@ -233,8 +233,19 @@ where
         }
 
         if let Some(command) = command {
-            self.rolling.lock().await.push(message.clone());
-            return self.handle_command(message, command).await;
+            let pre_command_recent_messages = {
+                let mut rolling = self.rolling.lock().await;
+                let snapshot = if matches!(&command, BotCommand::Summarize { .. }) {
+                    Some(rolling.recent_for_chat(message.chat_id))
+                } else {
+                    None
+                };
+                rolling.push(message.clone());
+                snapshot
+            };
+            return self
+                .handle_command(message, command, pre_command_recent_messages)
+                .await;
         }
 
         self.runtime.ensure_chat_runtime(message.chat_id).await?;
@@ -277,6 +288,7 @@ where
         &self,
         message: IncomingMessage,
         command: BotCommand,
+        pre_command_recent_messages: Option<Vec<IncomingMessage>>,
     ) -> Result<(), AppError> {
         match command {
             BotCommand::Help => {
@@ -405,7 +417,11 @@ where
             },
             BotCommand::Summarize { focus } => {
                 self.runtime.ensure_chat_runtime(message.chat_id).await?;
-                let recent_messages = self.rolling.lock().await.recent_for_chat(message.chat_id);
+                let recent_messages = if let Some(recent_messages) = pre_command_recent_messages {
+                    recent_messages
+                } else {
+                    self.rolling.lock().await.recent_for_chat(message.chat_id)
+                };
                 match crate::summary::build_summary_prompt(
                     &self.system_prompt_for_turn(),
                     &recent_messages,
@@ -1129,6 +1145,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn summarize_should_use_pre_command_recent_chat_with_capacity_one() {
+        let (app, runtime, mut messages) = app_with_fakes_and_rolling_capacity(1).await;
+
+        app.handle_message(incoming("the deploy is blocked"))
+            .await
+            .expect("ambient should store");
+        app.handle_message(incoming("/summarize@telellm_bot deploy"))
+            .await
+            .expect("summarize should work");
+
+        let prompt = messages
+            .recv()
+            .await
+            .expect("summary prompt should be echoed");
+        assert!(prompt.contains("catch-up recap"));
+        assert!(prompt.contains("the deploy is blocked"));
+        assert!(!prompt.contains("/summarize"));
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn voice_off_should_persist_chat_setting_without_runtime() {
         let (app, runtime, mut messages) = app_with_fakes().await;
 
@@ -1478,6 +1515,30 @@ mod tests {
         mpsc::UnboundedReceiver<String>,
     ) {
         let (app, runtime, messages, _codex) = app_with_fakes_and_session().await;
+        (app, runtime, messages)
+    }
+
+    async fn app_with_fakes_and_rolling_capacity(
+        capacity: usize,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, messages) = FakeTelegram::new();
+        let router = Arc::new(Router::new(4, telegram));
+        router
+            .register_session(ChatId(1), 1, Arc::new(FakeCodexSession::default()))
+            .await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let app = AppCore::new(
+            app_core_config(Vec::new(), true),
+            memory,
+            RollingBuffer::new(capacity),
+            router,
+            runtime.clone(),
+        );
         (app, runtime, messages)
     }
 

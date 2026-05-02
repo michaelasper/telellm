@@ -13,7 +13,7 @@ pub fn build_summary_prompt(
 ) -> Result<String, SummaryPromptError> {
     let useful: Vec<_> = recent_messages
         .iter()
-        .filter(|message| !message.text.trim_start().starts_with("/summarize"))
+        .filter(|message| !is_summary_command_text(&message.text))
         .filter(|message| !message.text.trim().is_empty() || !message.context_notes.is_empty())
         .collect();
     if useful.is_empty() {
@@ -35,7 +35,8 @@ pub fn build_summary_prompt(
         prompt.push_str("- ");
         prompt.push_str(name);
         prompt.push_str(": ");
-        prompt.push_str(message.text.trim());
+        let text = message.text.trim();
+        prompt.push_str(if text.is_empty() { "(no text)" } else { text });
         prompt.push('\n');
         for note in &message.context_notes {
             prompt.push_str("  context: ");
@@ -44,6 +45,21 @@ pub fn build_summary_prompt(
         }
     }
     Ok(prompt)
+}
+
+fn is_summary_command_text(text: &str) -> bool {
+    let Some(first_token) = text.trim().split_whitespace().next() else {
+        return false;
+    };
+    if !first_token.starts_with('/') {
+        return false;
+    }
+    let command_name = first_token
+        .trim_start_matches('/')
+        .split('@')
+        .next()
+        .unwrap_or_default();
+    command_name.eq_ignore_ascii_case("summarize")
 }
 
 #[cfg(test)]
@@ -86,6 +102,22 @@ mod tests {
     #[test]
     fn summary_prompt_should_reject_empty_recent_chat() {
         let err = build_summary_prompt("System prompt.", &[], None).expect_err("empty");
+        assert_eq!(err, SummaryPromptError::NoRecentChat);
+    }
+
+    #[test]
+    fn summary_prompt_should_reject_command_only_recent_chat_for_parser_compatible_forms() {
+        let err = build_summary_prompt(
+            "System prompt.",
+            &[
+                msg(1, "/Summarize"),
+                msg(2, "/SUMMARIZE@telellm_bot"),
+                msg(3, "/summarize@telellm_bot deploy"),
+            ],
+            None,
+        )
+        .expect_err("command-only chat");
+
         assert_eq!(err, SummaryPromptError::NoRecentChat);
     }
 }
