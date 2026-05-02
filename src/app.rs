@@ -385,31 +385,33 @@ where
     }
 
     async fn prepare_audio(&self, message: &mut IncomingMessage) -> Result<(), AppError> {
-        let mut has_usable_context = !message.text.trim().is_empty();
-        let mut first_audio_failure = None;
+        let mut trigger_has_usable_context = !message.text.trim().is_empty();
+        let mut trigger_audio_failure = None;
         self.prepare_audio_attachment_list(
             message.chat_id,
             message.message_id,
             &mut message.attachments,
             &mut message.context_notes,
-            &mut has_usable_context,
-            &mut first_audio_failure,
+            &mut trigger_has_usable_context,
+            &mut trigger_audio_failure,
         )
         .await;
 
         if let Some(reply_to) = &mut message.reply_to {
+            let mut reply_has_usable_context = false;
+            let mut reply_audio_failure = None;
             self.prepare_audio_attachment_list(
                 message.chat_id,
                 reply_to.message_id,
                 &mut reply_to.attachments,
                 &mut reply_to.context_notes,
-                &mut has_usable_context,
-                &mut first_audio_failure,
+                &mut reply_has_usable_context,
+                &mut reply_audio_failure,
             )
             .await;
         }
 
-        if !has_usable_context && let Some(reason) = first_audio_failure {
+        if !trigger_has_usable_context && let Some(reason) = trigger_audio_failure {
             return Err(AppError::Audio(reason));
         }
 
@@ -1287,6 +1289,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voice_only_trigger_failure_with_replied_audio_transcript_should_send_audio_error() {
+        let (app, _runtime, mut messages, codex) =
+            app_with_trigger_stt_failure_and_reply_stt_success().await;
+        let mut message = incoming_voice("", 15);
+        message.reply_to = Some(crate::bot::message::RepliedMessage {
+            message_id: MessageId(7),
+            from_name: Some("Mike".to_owned()),
+            text: String::new(),
+            attachments: vec![IncomingAttachment::new(
+                AttachmentKind::Voice,
+                "reply-voice-file-id".to_owned(),
+                "reply-voice-unique-id".to_owned(),
+                Some("reply.ogg".to_owned()),
+                Some("audio/ogg".to_owned()),
+                15,
+            )],
+            context_notes: Vec::new(),
+        });
+
+        IncomingMessageHandler::handle_message(&app, message).await;
+
+        let reply = messages.recv().await.expect("audio error should be sent");
+        assert_eq!(
+            reply,
+            "I could not transcribe that audio message. Check the daemon logs for details."
+        );
+        assert_eq!(codex.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn text_with_stt_failure_should_queue_with_skipped_context_note() {
         let (app, _runtime, mut messages, codex) =
             app_with_fakes_and_audio_stt_failure(false).await;
@@ -1445,6 +1477,34 @@ mod tests {
                 )));
             },
             fail_download,
+        )
+        .await
+    }
+
+    async fn app_with_trigger_stt_failure_and_reply_stt_success() -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+        Arc<FakeCodexSession>,
+    ) {
+        app_with_audio_failure_config(
+            |config| {
+                config.audio_stt = Some(Arc::new(crate::audio::LocalStt::new(
+                    crate::config::AudioToolConfig {
+                        command: "/bin/sh".to_owned(),
+                        args: vec![
+                            "-c".to_owned(),
+                            "if grep -q reply \"$2\"; then printf 'reply audio transcript' > \"$3\"; else exit 7; fi".to_owned(),
+                            "test-sh".to_owned(),
+                            "unused-transcript".to_owned(),
+                            "{input}".to_owned(),
+                            "{output}".to_owned(),
+                        ],
+                        timeout_secs: 5,
+                    },
+                )));
+            },
+            false,
         )
         .await
     }
@@ -1672,10 +1732,15 @@ mod tests {
             if self.fail_download.load(Ordering::SeqCst) {
                 return Err(TelegramError::Download("test download failure".to_owned()));
             }
-            tokio::fs::write(destination, b"fake attachment bytes")
+            let bytes = if _file_id.contains("reply") {
+                b"fake reply attachment bytes".as_slice()
+            } else {
+                b"fake attachment bytes".as_slice()
+            };
+            tokio::fs::write(destination, bytes)
                 .await
                 .map_err(|err| TelegramError::Download(err.to_string()))?;
-            Ok(21)
+            Ok(bytes.len() as u64)
         }
     }
 
