@@ -608,6 +608,7 @@ fn normalize_message(
         from_name,
         text,
         attachments,
+        context_notes: Vec::new(),
         reply_to_bot,
         reply_to,
         private_chat: message.chat.is_private(),
@@ -681,6 +682,7 @@ fn normalize_replied_message(message: &Message) -> Option<crate::bot::message::R
         from_name: message.from.as_ref().map(display_name),
         text,
         attachments,
+        context_notes: Vec::new(),
     })
 }
 

@@ -15,7 +15,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use secrecy::ExposeSecret;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -92,6 +92,12 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         attachments: config.attachments.clone(),
         outputs: config.outputs.clone(),
         audio: config.audio.clone(),
+        audio_stt: config
+            .audio
+            .stt
+            .clone()
+            .map(crate::audio::LocalStt::new)
+            .map(Arc::new),
     };
     let app_core = Arc::new(AppCore::new(
         app_core_config,
@@ -119,6 +125,7 @@ where
     attachments: AttachmentConfig,
     outputs: OutputConfig,
     audio: AudioConfig,
+    audio_stt: Option<Arc<crate::audio::LocalStt>>,
     memory_store: Arc<M>,
     rolling: Arc<Mutex<RollingBuffer>>,
     router: Arc<Router<S, T>>,
@@ -134,6 +141,7 @@ pub struct AppCoreConfig {
     pub attachments: AttachmentConfig,
     pub outputs: OutputConfig,
     pub audio: AudioConfig,
+    pub audio_stt: Option<Arc<crate::audio::LocalStt>>,
 }
 
 impl<M, S, T, N> AppCore<M, S, T, N>
@@ -158,6 +166,7 @@ where
             attachments,
             outputs,
             audio,
+            audio_stt,
         } = config;
 
         Self {
@@ -168,6 +177,7 @@ where
             attachments,
             outputs,
             audio,
+            audio_stt,
             memory_store,
             rolling: Arc::new(Mutex::new(rolling)),
             router,
@@ -193,6 +203,7 @@ where
         }
 
         self.runtime.ensure_chat_runtime(message.chat_id).await?;
+        self.prepare_audio(&mut message).await?;
         self.prepare_attachments(&mut message).await;
         self.rolling.lock().await.push(message.clone());
 
@@ -368,6 +379,162 @@ where
         Ok(())
     }
 
+    async fn prepare_audio(&self, message: &mut IncomingMessage) -> Result<(), AppError> {
+        let fail_on_trigger_stt_failure = message.text.trim().is_empty();
+        self.prepare_audio_attachment_list(
+            message.chat_id,
+            message.message_id,
+            &mut message.attachments,
+            &mut message.context_notes,
+            fail_on_trigger_stt_failure,
+        )
+        .await?;
+
+        if let Some(reply_to) = &mut message.reply_to {
+            let fail_on_reply_stt_failure =
+                message.text.trim().is_empty() && reply_to.text.trim().is_empty();
+            self.prepare_audio_attachment_list(
+                message.chat_id,
+                reply_to.message_id,
+                &mut reply_to.attachments,
+                &mut reply_to.context_notes,
+                fail_on_reply_stt_failure,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn prepare_audio_attachment_list(
+        &self,
+        chat_id: crate::ids::ChatId,
+        message_id: crate::ids::MessageId,
+        attachments: &mut [IncomingAttachment],
+        context_notes: &mut Vec<String>,
+        fail_on_stt_failure: bool,
+    ) -> Result<(), AppError> {
+        if attachments.is_empty() {
+            return Ok(());
+        }
+
+        for (index, attachment) in attachments.iter_mut().enumerate() {
+            if !crate::audio::is_audio_attachment(attachment) {
+                continue;
+            }
+
+            if !self.audio.enabled {
+                attachment.skipped_reason =
+                    Some("audio imports are disabled by configuration".to_owned());
+                continue;
+            }
+
+            match self
+                .import_audio_attachment(chat_id, message_id, index, attachment)
+                .await
+            {
+                Ok(imported) => {
+                    attachment.workspace_path = Some(imported.workspace_path.clone());
+                    if let Some(transcript) = imported.transcript {
+                        context_notes.push(format!(
+                            "Audio transcript from @{}: {}",
+                            imported.workspace_path, transcript
+                        ));
+                    } else if let Some(reason) = imported.skipped_reason {
+                        tracing::warn!(
+                            chat_id = ?chat_id,
+                            message_id = ?message_id,
+                            file_unique_id = %attachment.file_unique_id,
+                            reason = %reason,
+                            "failed to transcribe Telegram audio attachment"
+                        );
+                        if fail_on_stt_failure {
+                            return Err(AppError::Audio(reason));
+                        }
+                        context_notes.push(format!(
+                            "Audio transcript from @{} skipped: {}",
+                            imported.workspace_path, reason
+                        ));
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        chat_id = ?chat_id,
+                        message_id = ?message_id,
+                        file_unique_id = %attachment.file_unique_id,
+                        reason = %reason,
+                        "failed to import Telegram audio attachment"
+                    );
+                    attachment.skipped_reason = Some(reason);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn import_audio_attachment(
+        &self,
+        chat_id: crate::ids::ChatId,
+        message_id: crate::ids::MessageId,
+        index: usize,
+        attachment: &IncomingAttachment,
+    ) -> Result<crate::audio::ImportedAudio, String> {
+        if attachment.file_size > self.audio.max_file_bytes {
+            return Err(format!(
+                "file size {} exceeds configured audio limit {} bytes",
+                attachment.file_size, self.audio.max_file_bytes
+            ));
+        }
+
+        let workspace_path = crate::audio::audio_workspace_path(
+            &self.audio.workspace_dir,
+            message_id,
+            index,
+            attachment,
+        );
+        let temp_path = temp_attachment_path(message_id, index);
+        let transcript_path = temp_audio_transcript_path(message_id, index);
+        let result = async {
+            let downloaded_bytes = self
+                .router
+                .telegram()
+                .download_file_to_path(&attachment.file_id, &temp_path)
+                .await
+                .map_err(|err| err.to_string())?;
+            if downloaded_bytes > self.audio.max_file_bytes {
+                return Err(format!(
+                    "downloaded file size {downloaded_bytes} exceeds configured audio limit {} bytes",
+                    self.audio.max_file_bytes
+                ));
+            }
+            self.runtime
+                .import_chat_attachment(chat_id, &temp_path, &workspace_path)
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let mut imported = crate::audio::ImportedAudio {
+                workspace_path,
+                transcript: None,
+                skipped_reason: None,
+            };
+            if let Some(stt) = &self.audio_stt {
+                match stt.transcribe_to(&temp_path, &transcript_path).await {
+                    Ok(transcript) => imported.transcript = Some(transcript.text),
+                    Err(err) => imported.skipped_reason = Some(err.to_string()),
+                }
+            }
+
+            Ok(imported)
+        }
+        .await;
+
+        remove_temp_file(&temp_path, "temporary Telegram audio attachment").await;
+        remove_temp_file(&transcript_path, "temporary Telegram audio transcript").await;
+
+        result
+    }
+
     async fn prepare_attachments(&self, message: &mut IncomingMessage) {
         self.prepare_attachment_list(
             message.chat_id,
@@ -397,6 +564,9 @@ where
 
         if !self.attachments.enabled {
             for attachment in attachments {
+                if crate::audio::is_audio_attachment(attachment) {
+                    continue;
+                }
                 attachment.skipped_reason =
                     Some("attachment downloads are disabled by configuration".to_owned());
             }
@@ -404,6 +574,10 @@ where
         }
 
         for (index, attachment) in attachments.iter_mut().enumerate() {
+            if crate::audio::is_audio_attachment(attachment) {
+                continue;
+            }
+
             match self
                 .import_attachment(chat_id, message_id, index, attachment)
                 .await
@@ -519,28 +693,8 @@ fn attachment_workspace_path(
         "{workspace_dir}/msg-{}/{}-{}",
         message_id.0,
         index + 1,
-        sanitize_file_name(file_name)
+        crate::bot::message::sanitize_file_name(file_name)
     )
-}
-
-fn sanitize_file_name(file_name: &str) -> String {
-    let mut sanitized = String::with_capacity(file_name.len().min(128));
-    for ch in file_name.chars().take(128) {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-            sanitized.push(ch);
-        } else {
-            sanitized.push('_');
-        }
-    }
-
-    let sanitized = sanitized.trim_matches('_');
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
-        return "attachment".to_owned();
-    }
-    if sanitized.starts_with('.') {
-        return format!("attachment{sanitized}");
-    }
-    sanitized.to_owned()
 }
 
 fn temp_attachment_path(message_id: crate::ids::MessageId, index: usize) -> PathBuf {
@@ -553,6 +707,31 @@ fn temp_attachment_path(message_id: crate::ids::MessageId, index: usize) -> Path
         std::process::id(),
         message_id.0
     ))
+}
+
+fn temp_audio_transcript_path(message_id: crate::ids::MessageId, index: usize) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "telellm-stt-{}-{}-{index}-{nanos}.txt",
+        std::process::id(),
+        message_id.0
+    ))
+}
+
+async fn remove_temp_file(path: &Path, description: &str) {
+    if let Err(err) = tokio::fs::remove_file(path).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            error = %err,
+            path = %path.display(),
+            description,
+            "failed to remove temporary file"
+        );
+    }
 }
 
 #[async_trait]
@@ -592,6 +771,8 @@ pub enum AppError {
     Runtime(#[from] crate::runtime::RuntimeError),
     #[error("telegram error: {0}")]
     Telegram(#[from] TelegramError),
+    #[error("audio error: {0}")]
+    Audio(String),
 }
 
 fn help_text() -> &'static str {
@@ -605,6 +786,9 @@ fn user_visible_error(error: &AppError) -> Option<&'static str> {
         }
         AppError::Router(_) => {
             Some("I could not queue that request for Codex. Check the daemon logs for details.")
+        }
+        AppError::Audio(_) => {
+            Some("I could not transcribe that audio message. Check the daemon logs for details.")
         }
         AppError::Command(_) | AppError::Memory(_) | AppError::Telegram(_) => None,
     }
@@ -659,6 +843,7 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             attachments: Vec::new(),
+            context_notes: Vec::new(),
             reply_to_bot: false,
             reply_to: None,
             private_chat: false,
@@ -678,6 +863,7 @@ mod tests {
             attachments: AttachmentConfig::default(),
             outputs: OutputConfig::default(),
             audio: AudioConfig::default(),
+            audio_stt: None,
         }
     }
 
@@ -952,6 +1138,7 @@ mod tests {
                 Some("image/png".to_owned()),
                 15,
             )],
+            context_notes: Vec::new(),
         });
 
         app.handle_message(message)
@@ -967,6 +1154,37 @@ mod tests {
         );
         assert!(response.contains("Reply context:\n- Mike: (no text)"));
         assert!(response.contains("available at @telegram_uploads/msg-7/1-diagram.png"));
+    }
+
+    #[tokio::test]
+    async fn addressed_voice_should_import_transcribe_and_render_context() {
+        let (app, runtime, mut messages) =
+            app_with_fakes_and_audio_stt("hello from the voice note").await;
+        let mut message = incoming("@telellm_bot");
+        message.attachments.push(IncomingAttachment::new(
+            AttachmentKind::Voice,
+            "voice-file-id".to_owned(),
+            "voice-unique-id".to_owned(),
+            Some("voice.ogg".to_owned()),
+            Some("audio/ogg".to_owned()),
+            15,
+        ));
+
+        app.handle_message(message)
+            .await
+            .expect("voice message should be handled");
+
+        let prompt = messages
+            .recv()
+            .await
+            .expect("Codex prompt should be echoed");
+        let imported = runtime.imported.lock().await;
+        assert_eq!(
+            imported[0].workspace_path,
+            "telegram_audio/msg-1/1-voice.ogg"
+        );
+        assert!(prompt.contains("hello from the voice note"));
+        assert!(prompt.contains("@telegram_audio/msg-1/1-voice.ogg"));
     }
 
     async fn app_with_fakes() -> (
@@ -998,6 +1216,44 @@ mod tests {
             runtime.clone(),
         );
         (app, runtime, messages, codex)
+    }
+
+    async fn app_with_fakes_and_audio_stt(
+        transcript: &str,
+    ) -> (
+        AppCore<FakeMemoryStore, FakeCodexSession, FakeTelegram, FakeRuntime>,
+        Arc<FakeRuntime>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let memory = Arc::new(FakeMemoryStore::default());
+        let (telegram, messages) = FakeTelegram::new();
+        let router = Arc::new(Router::new(4, telegram));
+        router
+            .register_session(ChatId(1), 1, Arc::new(FakeCodexSession::default()))
+            .await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let mut config = app_core_config(Vec::new(), true);
+        let stt = crate::audio::LocalStt::new(crate::config::AudioToolConfig {
+            command: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf '%s' \"$1\" > \"$3\"".to_owned(),
+                "test-sh".to_owned(),
+                transcript.to_owned(),
+                "{input}".to_owned(),
+                "{output}".to_owned(),
+            ],
+            timeout_secs: 5,
+        });
+        config.audio_stt = Some(Arc::new(stt));
+        let app = AppCore::new(
+            config,
+            memory,
+            RollingBuffer::new(10),
+            router,
+            runtime.clone(),
+        );
+        (app, runtime, messages)
     }
 
     async fn app_with_fakes_and_allowed_chats(

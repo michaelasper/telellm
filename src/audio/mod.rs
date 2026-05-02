@@ -1,4 +1,5 @@
 use crate::{
+    bot::message::IncomingAttachment,
     bot::telegram::TelegramAudioSendKind,
     config::{AudioSendAs, AudioToolConfig, AudioTtsConfig},
     ids::{ChatId, MessageId},
@@ -29,6 +30,13 @@ pub struct SynthesizedAudio {
     pub file_name: String,
     pub send_as: AudioSendAs,
     pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedAudio {
+    pub workspace_path: String,
+    pub transcript: Option<String>,
+    pub skipped_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +178,33 @@ impl AudioSendAs {
             Self::Audio => TelegramAudioSendKind::Audio,
         }
     }
+}
+
+pub fn is_audio_attachment(attachment: &IncomingAttachment) -> bool {
+    attachment.kind.is_audio()
+        || attachment
+            .mime_type
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("audio/"))
+}
+
+pub fn audio_workspace_path(
+    workspace_dir: &str,
+    message_id: MessageId,
+    index: usize,
+    attachment: &IncomingAttachment,
+) -> String {
+    let workspace_dir = workspace_dir.trim_matches('/');
+    let file_name = attachment
+        .file_name
+        .as_deref()
+        .unwrap_or_else(|| attachment.kind.default_file_name());
+    format!(
+        "{workspace_dir}/msg-{}/{}-{}",
+        message_id.0,
+        index + 1,
+        crate::bot::message::sanitize_file_name(file_name)
+    )
 }
 
 #[async_trait]

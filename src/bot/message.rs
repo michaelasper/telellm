@@ -8,6 +8,7 @@ pub struct IncomingMessage {
     pub from_name: Option<String>,
     pub text: String,
     pub attachments: Vec<IncomingAttachment>,
+    pub context_notes: Vec<String>,
     pub reply_to_bot: bool,
     pub reply_to: Option<RepliedMessage>,
     pub private_chat: bool,
@@ -85,6 +86,7 @@ pub struct RepliedMessage {
     pub from_name: Option<String>,
     pub text: String,
     pub attachments: Vec<IncomingAttachment>,
+    pub context_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +113,26 @@ fn mentions_bot(text: &str, bot_username: &str) -> bool {
     })
 }
 
+pub fn sanitize_file_name(file_name: &str) -> String {
+    let mut sanitized = String::with_capacity(file_name.len().min(128));
+    for ch in file_name.chars().take(128) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return "attachment".to_owned();
+    }
+    if sanitized.starts_with('.') {
+        return format!("attachment{sanitized}");
+    }
+    sanitized.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +145,7 @@ mod tests {
             from_name: Some("Mike".to_owned()),
             text: text.to_owned(),
             attachments: Vec::new(),
+            context_notes: Vec::new(),
             reply_to_bot: false,
             reply_to: None,
             private_chat: false,
