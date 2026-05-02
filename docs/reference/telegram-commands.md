@@ -13,7 +13,7 @@ On startup, `telellm` registers this command list with Telegram so clients can s
 | Slash commands | Parsed by command name. |
 | Mention of `@bot_username` | Enqueued as an addressed Codex prompt. |
 | Reply to a bot message | Enqueued as an addressed Codex prompt. |
-| Photo or document with caption, in a DM, or in the replied-to message | Downloaded into the chat workspace when addressed. |
+| Photo, document, voice, or audio with caption, in a DM, or in the replied-to message | Downloaded into the chat workspace when addressed. |
 | Generated file reference in Codex response | Files under `outputs.workspace_dir` are sent as Telegram documents when the final response mentions them as `@...` paths. |
 | Plain ambient group message | Stored only in the in-memory recent buffer when Telegram delivers it. |
 

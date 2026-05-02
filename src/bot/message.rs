@@ -51,6 +51,8 @@ impl IncomingAttachment {
 pub enum AttachmentKind {
     Photo,
     Document,
+    Voice,
+    Audio,
 }
 
 impl AttachmentKind {
@@ -58,6 +60,8 @@ impl AttachmentKind {
         match self {
             Self::Photo => "photo",
             Self::Document => "document",
+            Self::Voice => "voice",
+            Self::Audio => "audio",
         }
     }
 
@@ -65,7 +69,13 @@ impl AttachmentKind {
         match self {
             Self::Photo => "photo.jpg",
             Self::Document => "document",
+            Self::Voice => "voice.ogg",
+            Self::Audio => "audio",
         }
+    }
+
+    pub fn is_audio(self) -> bool {
+        matches!(self, Self::Voice | Self::Audio)
     }
 }
 
@@ -154,5 +164,21 @@ mod tests {
         msg.private_chat = true;
 
         assert_eq!(msg.addressing("telellm_bot"), Addressing::Addressed);
+    }
+
+    #[test]
+    fn attachment_kind_should_identify_audio() {
+        assert!(AttachmentKind::Voice.is_audio());
+        assert!(AttachmentKind::Audio.is_audio());
+        assert!(!AttachmentKind::Photo.is_audio());
+        assert!(!AttachmentKind::Document.is_audio());
+    }
+
+    #[test]
+    fn attachment_kind_should_name_audio_defaults() {
+        assert_eq!(AttachmentKind::Voice.as_str(), "voice");
+        assert_eq!(AttachmentKind::Audio.as_str(), "audio");
+        assert_eq!(AttachmentKind::Voice.default_file_name(), "voice.ogg");
+        assert_eq!(AttachmentKind::Audio.default_file_name(), "audio");
     }
 }
