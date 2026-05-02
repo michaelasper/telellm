@@ -335,6 +335,8 @@ where
                         if text_sent {
                             Self::send_audio_reply(
                                 &telegram,
+                                &sessions,
+                                generation,
                                 audio_replies.clone(),
                                 chat_id,
                                 audio_reply,
@@ -497,6 +499,8 @@ where
 
     async fn send_audio_reply(
         telegram: &Arc<T>,
+        sessions: &Arc<Mutex<HashMap<ChatId, RegisteredSession<S>>>>,
+        generation: u64,
         audio_replies: Option<Arc<dyn crate::audio::AudioReplySynthesizer>>,
         chat_id: ChatId,
         audio_reply: Option<crate::audio::AudioReplyRequest>,
@@ -505,6 +509,9 @@ where
         let (Some(audio_replies), Some(request)) = (audio_replies, audio_reply) else {
             return;
         };
+        if Self::worker_is_stale(sessions, chat_id, generation).await {
+            return;
+        }
 
         let mut request = request.clone();
         request.text = output.to_owned();
@@ -520,6 +527,10 @@ where
                 return;
             }
         };
+        if Self::worker_is_stale(sessions, chat_id, generation).await {
+            remove_synthesized_audio_file(&audio).await;
+            return;
+        }
 
         if let Err(err) = telegram
             .send_audio_file(
@@ -676,6 +687,16 @@ fn log_generated_file_cleanup_error(file: &GeneratedFile, err: std::io::Error) {
         workspace_path = %file.workspace_path,
         "failed to remove temporary generated file"
     );
+}
+
+async fn remove_synthesized_audio_file(audio: &crate::audio::SynthesizedAudio) {
+    if let Err(err) = tokio::fs::remove_file(&audio.host_path).await {
+        tracing::debug!(
+            error = %err,
+            path = %audio.host_path.display(),
+            "failed to remove temporary spoken reply file"
+        );
+    }
 }
 
 fn streaming_preview(output: &str, max_chars: usize) -> String {
@@ -911,13 +932,13 @@ mod tests {
     }
 
     struct FakeAudioReplySynthesizer {
-        bytes: Vec<u8>,
+        prefix: String,
     }
 
     impl FakeAudioReplySynthesizer {
-        fn new(bytes: impl AsRef<[u8]>) -> Self {
+        fn new(prefix: impl Into<String>) -> Self {
             Self {
-                bytes: bytes.as_ref().to_vec(),
+                prefix: prefix.into(),
             }
         }
     }
@@ -926,11 +947,12 @@ mod tests {
     impl AudioReplySynthesizer for FakeAudioReplySynthesizer {
         async fn synthesize_reply(
             &self,
-            _request: AudioReplyRequest,
+            request: AudioReplyRequest,
         ) -> Result<Option<SynthesizedAudio>, AudioError> {
             let file = tempfile::NamedTempFile::new().expect("temp audio file should be created");
             let path = file.path().to_path_buf();
-            tokio::fs::write(&path, &self.bytes)
+            let bytes = format!("{}:{}", self.prefix, request.text);
+            tokio::fs::write(&path, bytes.as_bytes())
                 .await
                 .expect("temp audio file should be writable");
             let path = file
@@ -941,7 +963,7 @@ mod tests {
                 host_path: path,
                 file_name: "reply.ogg".to_owned(),
                 send_as: AudioSendAs::Voice,
-                bytes: self.bytes.len() as u64,
+                bytes: bytes.len() as u64,
             }))
         }
     }
@@ -955,6 +977,57 @@ mod tests {
             _request: AudioReplyRequest,
         ) -> Result<Option<SynthesizedAudio>, AudioError> {
             Err(AudioError::EmptyOutput)
+        }
+    }
+
+    struct BlockingAudioReplySynthesizer {
+        entered: mpsc::UnboundedSender<std::path::PathBuf>,
+        release: tokio::sync::Notify,
+    }
+
+    impl BlockingAudioReplySynthesizer {
+        fn new() -> (Self, mpsc::UnboundedReceiver<std::path::PathBuf>) {
+            let (entered_tx, entered_rx) = mpsc::unbounded_channel();
+            (
+                Self {
+                    entered: entered_tx,
+                    release: tokio::sync::Notify::new(),
+                },
+                entered_rx,
+            )
+        }
+
+        fn release(&self) {
+            self.release.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl AudioReplySynthesizer for BlockingAudioReplySynthesizer {
+        async fn synthesize_reply(
+            &self,
+            request: AudioReplyRequest,
+        ) -> Result<Option<SynthesizedAudio>, AudioError> {
+            let file = tempfile::NamedTempFile::new().expect("temp audio file should be created");
+            let path = file.path().to_path_buf();
+            tokio::fs::write(&path, request.text.as_bytes())
+                .await
+                .expect("temp audio file should be writable");
+            let path = file
+                .into_temp_path()
+                .keep()
+                .expect("temp audio file should persist for Telegram send");
+            self.entered
+                .send(path.clone())
+                .expect("test should receive synthesize start");
+            self.release.notified().await;
+
+            Ok(Some(SynthesizedAudio {
+                host_path: path,
+                file_name: "reply.ogg".to_owned(),
+                send_as: AudioSendAs::Voice,
+                bytes: request.text.len() as u64,
+            }))
         }
     }
 
@@ -1033,7 +1106,8 @@ mod tests {
                 crate::bot::telegram::TelegramAudioSendKind::Voice => "voice",
                 crate::bot::telegram::TelegramAudioSendKind::Audio => "audio",
             };
-            let text = format!("{kind}:{file_name}:{}", path.exists());
+            let contents = tokio::fs::read_to_string(path).await.unwrap_or_default();
+            let text = format!("{kind}:{file_name}:{}:{contents}", path.exists());
             self.audio_files
                 .send(text)
                 .map_err(|err| TelegramError::AudioSend(err.to_string()))?;
@@ -1205,6 +1279,54 @@ mod tests {
 
         assert!(text.contains("reply: hello"));
         assert!(audio.contains("voice"));
+        assert!(audio.contains("reply: hello"));
+    }
+
+    #[tokio::test]
+    async fn router_should_drop_audio_reply_when_session_stales_during_synthesis() {
+        let (telegram, mut messages, _typing, mut audio_files) = FakeTelegram::new();
+        let (synthesizer, mut synthesized_paths) = BlockingAudioReplySynthesizer::new();
+        let synthesizer = Arc::new(synthesizer);
+        let router = Router::new_with_audio_replies(
+            4,
+            telegram,
+            TelegramUxConfig::default(),
+            synthesizer.clone(),
+        );
+        router
+            .register_session(ChatId(1), 1, Arc::new(FakeSession::default()))
+            .await;
+
+        router
+            .enqueue(GroupWorkItem {
+                chat_id: ChatId(1),
+                prompt: "hello".to_owned(),
+                audio_reply: Some(AudioReplyRequest {
+                    chat_id: ChatId(1),
+                    trigger_message_id: MessageId(7),
+                    text: String::new(),
+                }),
+            })
+            .await
+            .expect("enqueue should work");
+
+        assert!(
+            receive_message(&mut messages)
+                .await
+                .contains("reply: hello")
+        );
+        let synthesized_path = timeout(Duration::from_secs(1), synthesized_paths.recv())
+            .await
+            .expect("synthesis should start")
+            .expect("synthesized path should be reported");
+        router.mark_session_stale(ChatId(1)).await;
+        synthesizer.release();
+        wait_for_removed(&synthesized_path).await;
+
+        assert!(matches!(
+            audio_files.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
