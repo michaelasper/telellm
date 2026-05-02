@@ -14,8 +14,9 @@ use tokio::{
     process::Command,
 };
 
-const DEFAULT_MAX_OUTPUT_BYTES: u64 = 25 * 1024 * 1024;
+const DEFAULT_MAX_OUTPUT_BYTES: u64 = 20_000_000;
 const STDERR_TAIL_BYTES: usize = 4096;
+const STDERR_DRAIN_AFTER_REAP: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcript {
@@ -246,7 +247,7 @@ async fn run_audio_command(
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            let _ = stderr_task.await;
+            let _ = collect_stderr_after_reap(stderr_task).await;
             return Err(AudioError::Timeout {
                 command: command.to_owned(),
                 timeout_secs,
@@ -254,7 +255,7 @@ async fn run_audio_command(
         }
     };
 
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stderr = collect_stderr_after_reap(stderr_task).await;
 
     if !status.success() {
         return Err(AudioError::Exit {
@@ -314,6 +315,19 @@ async fn read_stderr_tail(stderr: Option<tokio::process::ChildStderr>) -> String
     }
 
     String::from_utf8_lossy(&tail).trim().to_owned()
+}
+
+async fn collect_stderr_after_reap(task: tokio::task::JoinHandle<String>) -> String {
+    let mut task = task;
+    match tokio::time::timeout(STDERR_DRAIN_AFTER_REAP, &mut task).await {
+        Ok(Ok(stderr)) => stderr,
+        Ok(Err(_)) => String::new(),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            String::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -507,6 +521,34 @@ mod tests {
         };
         assert!(stderr.len() <= 4096);
         assert!(stderr.ends_with("tail-marker"));
+    }
+
+    #[tokio::test]
+    async fn command_should_not_wait_for_descendant_inherited_stderr() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("reply.ogg");
+        let runner = LocalTts::new(AudioTtsConfig {
+            command: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "(sleep 2) & printf 'spoken reply' > \"$1\"".to_owned(),
+                "test-sh".to_owned(),
+                "{output}".to_owned(),
+            ],
+            stdin_text: false,
+            timeout_secs: 5,
+            send_as: AudioSendAs::Voice,
+        });
+
+        let speech = tokio::time::timeout(
+            Duration::from_millis(500),
+            runner.synthesize_to("spoken reply", &output),
+        )
+        .await
+        .expect("adapter should not wait for descendant stderr")
+        .expect("synthesis should work");
+
+        assert_eq!(speech.bytes, 12);
     }
 
     #[test]
