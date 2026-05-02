@@ -339,6 +339,7 @@ fn build_client(
     resolved: Option<(&str, &[SocketAddr])>,
 ) -> Result<reqwest::Client, UrlIngestionError> {
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(config.timeout_secs))
         .user_agent(config.user_agent.clone());
@@ -451,6 +452,7 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
         (Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32),
         (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
+        (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
         (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
         (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
         (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
@@ -554,6 +556,7 @@ mod tests {
             "203.0.113.1",
             "255.255.255.255",
             "2001:db8::1",
+            "3fff::1",
         ] {
             assert!(
                 is_blocked_ip(ip.parse().expect("ip")),
