@@ -23,7 +23,7 @@ command = "piper"
 args = ["--model", "/models/en_US-lessac-medium.onnx", "--output_file", "{output}"]
 stdin_text = true
 timeout_secs = 120
-send_as = "voice"
+send_as = "audio"
 ```
 
 Check the local commands before starting the daemon:
@@ -45,7 +45,7 @@ Example TTS invocation:
 printf 'hello from telellm' | piper --model /models/en_US-lessac-medium.onnx --output_file /tmp/reply.wav
 ```
 
-Match the configured arguments to the installed tool versions. `{input}` is replaced only for STT. `{output}` is replaced for STT and TTS. If `send_as = "voice"`, the TTS output must be acceptable to Telegram voice uploads; use `send_as = "audio"` or a wrapper command when your synthesizer produces a regular audio file.
+Match the configured arguments to the installed tool versions. `{input}` is replaced only for STT. `{output}` is replaced for STT and TTS. Plain `piper` output is a regular audio file, so the example uses `send_as = "audio"`. Use `send_as = "voice"` only with a wrapper command that produces Telegram voice-compatible audio.
 
 ## Check Runtime Availability
 

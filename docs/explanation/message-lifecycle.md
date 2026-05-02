@@ -10,7 +10,7 @@ An ambient message is group chat that is not a command, does not mention the bot
 
 When Telegram delivers an ambient message, the daemon stores it in the in-memory rolling buffer for that chat. It does not start Codex and does not reply.
 
-Unaddressed attachments, voice/audio messages, and URLs are not downloaded, transcribed, or fetched. They become input only when Telegram delivers them as part of an addressed message or reply context.
+Unaddressed attachments, voice/audio messages, and URLs are not downloaded, transcribed, or fetched. Attachments and audio become input when Telegram delivers them as part of an addressed message or reply context; URL snapshots are fetched only from the triggering addressed message text.
 
 The rolling buffer is short-lived process memory. It is useful for context, not for permanent transcript storage.
 
