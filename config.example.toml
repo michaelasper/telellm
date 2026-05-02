@@ -32,6 +32,32 @@ workspace_dir = "telegram_outputs"
 max_file_bytes = 20000000
 max_files_per_response = 4
 
+[audio]
+enabled = true
+replies_enabled = true
+workspace_dir = "telegram_audio"
+max_file_bytes = 20000000
+
+[audio.stt]
+command = "whisper-cli"
+args = ["--model", "/models/ggml-base.en.bin", "--file", "{input}", "--output-txt", "{output}"]
+timeout_secs = 120
+
+[audio.tts]
+command = "piper"
+args = ["--model", "/models/en_US-lessac-medium.onnx", "--output_file", "{output}"]
+stdin_text = true
+timeout_secs = 120
+send_as = "voice"
+
+[url_ingestion]
+enabled = true
+workspace_dir = "web_pages"
+max_urls_per_message = 3
+max_fetch_bytes = 2000000
+timeout_secs = 20
+user_agent = "telellm/0.1"
+
 [prompt]
 system_prompt = """
 You are the Telegram group assistant for this chat.

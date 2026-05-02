@@ -1105,6 +1105,8 @@ mod tests {
             telegram_ux: crate::config::TelegramUxConfig::default(),
             attachments: crate::config::AttachmentConfig::default(),
             outputs: OutputConfig::default(),
+            audio: crate::config::AudioConfig::default(),
+            url_ingestion: crate::config::UrlIngestionConfig::default(),
             prompt: crate::config::PromptConfig::default(),
             storage: StorageConfig {
                 sqlite_path: "data/telellm.sqlite".into(),

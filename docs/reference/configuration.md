@@ -60,6 +60,60 @@ All fields are optional. The section controls files Codex creates in the chat wo
 
 `workspace_dir` must be a non-empty relative path without parent directory components. `max_file_bytes` and `max_files_per_response` must be greater than zero.
 
+## `[audio]`
+
+All fields are optional. The section controls inbound audio transcription and optional spoken replies.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | Enables inbound Telegram voice/audio processing when an STT command is configured. |
+| `replies_enabled` | boolean | `true` | Allows chats to receive synthesized spoken replies when TTS is configured and chat voice mode allows it. |
+| `workspace_dir` | string | `telegram_audio` | Relative directory under `/workspace` where imported audio artifacts are stored. |
+| `max_file_bytes` | integer | `20000000` | Maximum Telegram audio file size to download for transcription. |
+
+`workspace_dir` must be a non-empty relative path without parent directory components. `max_file_bytes` must be greater than zero. STT and TTS command subsections are optional.
+
+## `[audio.stt]`
+
+Optional local speech-to-text command configuration.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `command` | string | `whisper-cli` | Local command used to transcribe downloaded audio. |
+| `args` | array of strings | `["--model", "/models/ggml-base.en.bin", "--file", "{input}", "--output-txt", "{output}"]` | Arguments passed to the STT command. `{input}` is the host path to source audio and `{output}` is where transcript text should be written. |
+| `timeout_secs` | integer | `120` | Maximum time to wait for the STT command. |
+
+`command` must not be empty. `timeout_secs` must be greater than zero.
+
+## `[audio.tts]`
+
+Optional local text-to-speech command configuration.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `command` | string | `piper` | Local command used to synthesize spoken replies. |
+| `args` | array of strings | `["--model", "/models/en_US-lessac-medium.onnx", "--output_file", "{output}"]` | Arguments passed to the TTS command. `{output}` is where generated audio should be written. |
+| `stdin_text` | boolean | `true` | Writes the final Codex text to the TTS command's standard input. |
+| `timeout_secs` | integer | `120` | Maximum time to wait for the TTS command. |
+| `send_as` | string | `voice` | Telegram upload mode for generated speech. Valid values are `voice` and `audio`. |
+
+`command` must not be empty. `timeout_secs` must be greater than zero.
+
+## `[url_ingestion]`
+
+All fields are optional. The section controls bounded fetching of URLs from addressed messages and DMs.
+
+| Field | Type | Default In Example | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | Enables URL fetching and readable-content extraction for addressed messages. |
+| `workspace_dir` | string | `web_pages` | Relative directory under `/workspace` where fetched page snapshots are stored. |
+| `max_urls_per_message` | integer | `3` | Maximum URLs to fetch from one Telegram message. |
+| `max_fetch_bytes` | integer | `2000000` | Maximum response bytes to read for one URL. |
+| `timeout_secs` | integer | `20` | Maximum time to wait for each URL fetch. |
+| `user_agent` | string | `telellm/0.1` | User-Agent sent with URL fetch requests. |
+
+`workspace_dir` must be a non-empty relative path without parent directory components. `user_agent` must not be empty. `max_urls_per_message`, `max_fetch_bytes`, and `timeout_secs` must be greater than zero.
+
 ## `[prompt]`
 
 | Field | Type | Required | Default In Example | Description |
